@@ -3,10 +3,10 @@
 A Rust autonomous project manager for approved specs: local Claude Code, Codex, and OpenCode workers produce independently reviewed GitHub PRs. Users own product merges. v1 acceptance is the full workflow in docs/PLAN.md on macOS and Linux.
 
 ## Status
-Planning scaffold, 2026-11-02. Implementation begins at M0; no runtime exists yet.
+M0 foundation, 2026-11-02: Rust contracts, SQLite migration, and deterministic fake-process demo exist. No daemon, real backend adapters, or project execution runtime yet.
 
 ## Commands
-M0 establishes: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace --release`. These are required once Cargo exists.
+Required gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace --release`.
 
 ## Pointers
 - docs/PLAN.md — canonical spec, architecture, milestone map, acceptance.
