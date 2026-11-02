@@ -3,7 +3,7 @@
 - Repository: https://github.com/ContractorKeith/agentpm
 - Basecamp card: https://app.basecamp.com/6307587/buckets/49448999/card_tables/cards/10466615798
 - T3 project: mcp:1b693dce-06fe-4e58-b089-40e426fbb168
-- Status: M0 implementation next; no runtime or release yet.
+- Status: M0 implementation running in a Sol 6.1 T3 worktree; no accepted runtime or release yet.
 - Build authority: Sol 6.1 workers in new T3 worktree threads; primary orchestrator reviews, integrates, and maintains tracking. No nested worker delegation.
 
 ## Milestones
@@ -22,4 +22,3 @@
 - M11: [Attention queue, human decisions, and local MCP](https://github.com/ContractorKeith/agentpm/issues/12) — open; Basecamp step 10466617754.
 - M12: [Daily-use TUI over the shared supervisor](https://github.com/ContractorKeith/agentpm/issues/13) — open; Basecamp step 10466617823.
 - M13: [Live acceptance and release packaging](https://github.com/ContractorKeith/agentpm/issues/14) — open; Basecamp step 10466617894.
-
