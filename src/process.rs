@@ -17,12 +17,27 @@ pub fn launch_session(executable: &Path, script: &str, session: &str) -> Result<
         .env("AGENTPM_EXECUTION_ID", session)
         .arg(script)
         .arg("--realtime")
-        .stdin(Stdio::null())
+        .stdin(if script == "-" {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .map_err(|e| format!("launch {}: {e}", executable.display()))
+}
+pub fn launch_snapshot(executable: &Path, bytes: &[u8], session: &str) -> Result<Child, String> {
+    use std::io::Write;
+    let mut child = launch_session(executable, "-", session)?;
+    let result = child.stdin.take().ok_or("missing stdin")?.write_all(bytes);
+    if let Err(e) = result {
+        let _ = child.kill();
+        let _ = finish(child);
+        return Err(format!("deliver snapshot: {e}"));
+    }
+    Ok(child)
 }
 fn drain(mut stream: impl Read) -> (Vec<u8>, bool) {
     let mut saved = Vec::new();
@@ -44,32 +59,54 @@ fn drain(mut stream: impl Read) -> (Vec<u8>, bool) {
     }
     (saved, overflow)
 }
-pub fn finish(mut child: Child) -> Result<String, String> {
+// WNOWAIT reserves the leader PID/PGID until all group signals are complete.
+fn exited_unreaped(child: &Child) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+pub fn finish(child: Child) -> Result<String, String> {
+    finish_with_timeout(child, Duration::from_secs(30))
+}
+pub fn finish_with_timeout(mut child: Child, timeout: Duration) -> Result<String, String> {
     let stdout = child.stdout.take().ok_or("missing stdout")?;
     let stderr = child.stderr.take().ok_or("missing stderr")?;
     let out = thread::spawn(move || drain(stdout));
     let err = thread::spawn(move || drain(stderr));
     let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            // Only this newly spawned process group is owned; never use stored PIDs.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.wait();
-            break child
-                .try_wait()
-                .map_err(|e| e.to_string())?
-                .ok_or("timeout reaping child")?;
+    let exited = loop {
+        let exited = exited_unreaped(&child)?;
+        if exited || start.elapsed() >= timeout {
+            break exited;
         }
         thread::sleep(Duration::from_millis(10));
     };
-    // Reap descendants that might otherwise hold the pipes open indefinitely.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    // The unreaped leader reserves the numeric group identity, even after exit.
+    // Never signal this group after wait() releases that identity.
+    let signal = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let signal_error = if signal != 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if let Some(e) = signal_error {
+        // Darwin can return EPERM for a group containing only the zombie leader.
+        let zombie_only =
+            cfg!(target_os = "macos") && exited && e.raw_os_error() == Some(libc::EPERM);
+        if e.raw_os_error() != Some(libc::ESRCH) && !zombie_only {
+            return Err(e.to_string());
+        }
     }
     let (bytes, overflow) = out.join().map_err(|_| "stdout reader panicked")?;
     let (diagnostic, truncated) = err.join().map_err(|_| "stderr reader panicked")?;
@@ -115,4 +152,62 @@ pub fn finish(mut child: Child) -> Result<String, String> {
             )
         })
         .map_err(|e| format!("{e}; {diagnostics}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exit_is_observed_without_releasing_identity_until_group_cleanup() {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // This shell has no command and exits; repeated WNOWAIT must still observe it.
+        let start = Instant::now();
+        while !exited_unreaped(&child).unwrap() {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited_unreaped(&child).unwrap());
+        // finish owns the only reap, even though protocol validation fails.
+        let pid = child.id();
+        let result = finish_with_timeout(child, Duration::from_secs(1));
+        assert!(result.is_err());
+        let rc = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(rc, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+    #[test]
+    fn normal_exit_and_timeout_clean_up_descendant_pipe_holders() {
+        use std::os::unix::process::CommandExt;
+        for timeout in [false, true] {
+            let command = if timeout {
+                "sleep 10 & wait"
+            } else {
+                "sleep 10 & echo '{\"protocol_version\":1,\"action\":{\"kind\":\"success\"}}'"
+            };
+            let child = Command::new("/bin/sh")
+                .args(["-c", command])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            let result = finish_with_timeout(child, Duration::from_millis(100));
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "descendant pipes were not closed"
+            );
+            assert_eq!(result.is_err(), timeout);
+        }
+    }
 }

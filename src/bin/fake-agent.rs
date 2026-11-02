@@ -4,9 +4,12 @@ use std::io::{Read, Write};
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let path = std::env::args_os().nth(1).ok_or("missing script")?;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    let input: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(path)?)
+    };
+    input.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err("script exceeds limit".into());
     }

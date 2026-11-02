@@ -5,19 +5,33 @@ Stale sockets are replaced only after obtaining the lock. The default data
 directory is ~/.agentpm; --data-dir supports isolated installations/tests.
 The socket protocol is newline-delimited JSON with version 1, an ASCII request
 id, and a tagged command. Unknown fields/versions fail before command effects.
-One bounded request/response uses each connection, with read/write deadlines.
+One bounded request/response uses each connection. Each service read/write frame
+has an absolute two-second deadline; client frames have five seconds each.
+Partial progress never refreshes these deadlines, and clients bound writes too.
+Fresh foreground/background directories are created with mode 700.
 Start, show, events and status are shared by the CLI and public client seam.
 
-SQLite schema version 2 adds narrowly scoped fake_runs, supervisor_requests,
+SQLite schema version 2 introduced narrowly scoped fake_runs, supervisor_requests,
 and supervisor_events tables without changing the M0 domain tables. These are
 fake execution records, not assertions of reviewed product delivery. Fake
 success is recorded as finished with an explicit succeeded result; it never
 sets the domain run's completed flag. Launch intent, operation/session token,
-script payload, executable, cwd and timestamp are durable before spawning.
+script bytes, executable, cwd and timestamp are durable before spawning.
+Schema v3 adds a bounded script_bytes BLOB. Migration preserves v2 records with
+NULL bytes as unknown input; it never fabricates a snapshot from their paths.
+New starts snapshot at most 64 KiB from a regular file before acceptance and
+persist those exact bytes with the intent. The child consumes this in-memory
+snapshot through stdin, never reopening the source path. Later path edits or
+deletion cannot change accepted work; retries return the original acceptance
+and show retrieves the original execution result. Missing/unreadable/nonregular
+or oversized input fails with a snapshot diagnostic before any run/intent is
+accepted. Invalid JSON is accepted as input bytes and fails in the fake child
+with retained parser diagnostics.
 PID (also process group leader) is recorded in the launch receipt. Tokens are
 logical execution identities (also passed as AGENTPM_EXECUTION_ID), not proof that a stored PID remains owned.
 Accepted request response and initial event are committed together. Exact
 retries return the original response; ID reuse with different payload fails.
+Read commands bypass mutation-ID lookup even when IDs collide.
 Final result and event also commit together. No process launch is atomically
 coupled to SQLite: crashes between intent, launch, receipt and completion leave
 uncertain records. M1 never replays those operations or kills stored PIDs.
@@ -36,7 +50,14 @@ stdout invalidates the result; stderr truncation is explicitly marked. Protocol
 validation checks terminal records and exact exit agreement, preserving raw
 bounded output and diagnostics in the result. A fixed 30-second fake-process
 safety deadline kills only the newly spawned owned group. Remaining descendants
-in that group are terminated after child exit to close inherited pipes. This
+in that group are terminated after observing child exit using waitid WNOWAIT,
+while the unreaped leader still reserves the process/group identity. Timeout
+uses the same signal-before-reap order. The leader is reaped once, after the
+last group signal; no stored or released numeric identity is signaled. Darwin's
+EPERM for an exited zombie-only group is tolerated; unexpected signal failures
+are reported after reaping. Regression tests establish WNOWAIT/reap ordering
+and cleanup of descendants holding pipes on exit and timeout; they do not claim
+to reproduce or prove PID reuse. This
 is a fake boundary, not an adapter or a security sandbox against hostile
 same-user children escaping their group. IPC frames are capped at 1 MiB and
 events are paged one at a time; durable history is retained until explicit
@@ -48,3 +69,9 @@ service restart after completion, protocol mismatch before effects, competing
 service locking, missing/invalid scripts, excessive stdout and stderr, and
 background CLI startup. Local results establish macOS behavior only; Linux CI
 and independent review remain integration gates.
+
+Review regression coverage also includes real socket byte dripping beyond the
+absolute deadline with queued status progress, mutation IDs status/show/events,
+fresh foreground creation under umask 022, immutable input after edits/deletion,
+retries after restart without source files, oversized snapshot rejection, and
+repeatable v2-to-v3 migration preserving uncertain records.
