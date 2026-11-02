@@ -10,9 +10,12 @@ human approval. Issue bodies/comments must already be snapshotted into a file;
 this module does not fetch GitHub or infer approval.
 
 Collection is explicit: absolute files under explicit canonical directory roots,
-64 input entries and 1 MiB aggregate content, no recursive discovery. Credential
+64 input entries, 1 MiB serialized manifest metadata and 1 MiB aggregate content,
+no recursive discovery. Published packages are limited to 16 MiB, matching retrieval;
+limits also apply to public API callers before publication. Credential
 path components and common key filenames are denied before and after symlink
-resolution. Non-files and non-UTF-8 inputs fail. These guards prevent incidental
+resolution. Non-files are rejected before opening and checked again on the descriptor;
+non-UTF-8 inputs fail. These guards prevent incidental
 collection, not malicious same-user filesystem races or secrets disguised in
 ordinary source files. Collection assumes sources are not concurrently replaced.
 
@@ -21,7 +24,8 @@ skill selections. No fallback, installation, canonical skill edits or dispatch
 occurs. Explicit update requires acknowledgment equal to the old revision and
 retains that revision. Collection completes before publication. Staging and an
 exclusive hard link publish complete files without overwrite; file and directory
-sync provide durability. Context directory is private on Unix. Retrieval validates
+sync protect published contents. Power-loss durability of newly created parent
+directories is not yet established. Context directory is private on Unix. Retrieval validates
 package and artifact hashes without consulting the original inputs.
 
 M8 must deliver the selected package revision and record worker acknowledgment;

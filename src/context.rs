@@ -9,6 +9,7 @@ use std::{
 };
 
 const LIMIT: usize = 1024 * 1024;
+const PACKAGE_LIMIT: usize = 16 * LIMIT;
 const MAX_FILES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +78,9 @@ fn credential(path: &Path) -> bool {
                     | ".gnupg"
                     | "credentials"
                     | "credentials.json"
+                    | ".credentials.json"
+                    | ".netrc"
+                    | ".npmrc"
                     | "auth.json"
                     | "hosts.yml"
                     | "id_rsa"
@@ -87,6 +91,13 @@ fn credential(path: &Path) -> bool {
     })
 }
 fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    // Opening a FIFO can block before descriptor metadata is available.
+    if !fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .is_file()
+    {
+        return Err("input must be a regular file".into());
+    }
     let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("input must be a regular file".into());
@@ -108,6 +119,14 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
 
 /// Read-only snapshot construction; all required inputs validate before storage.
 pub fn collect(manifest: Manifest, previous: Option<String>) -> Result<Package, String> {
+    // Library callers must obey the same metadata bound as manifest-file callers.
+    if serde_json::to_vec(&manifest)
+        .map_err(|e| e.to_string())?
+        .len()
+        > LIMIT
+    {
+        return Err("context manifest exceeds byte limit".into());
+    }
     if manifest.version != 1 || manifest.roots.is_empty() {
         return Err("unsupported manifest version or missing collection roots".into());
     }
@@ -220,7 +239,7 @@ impl ContextStore {
         Ok(self.root.join(format!("{id}.json")))
     }
     pub fn show(&self, id: &str) -> Result<Package, String> {
-        let bytes = bounded_read(&self.path(id)?, 16 * LIMIT)?;
+        let bytes = bounded_read(&self.path(id)?, PACKAGE_LIMIT)?;
         if identity(&bytes) != id {
             return Err("context integrity check failed".into());
         }
@@ -254,6 +273,9 @@ impl ContextStore {
     fn save(&self, package: Package) -> Result<String, String> {
         use std::io::Write;
         let bytes = serde_json::to_vec(&package).map_err(|e| e.to_string())?;
+        if bytes.len() > PACKAGE_LIMIT {
+            return Err("serialized context package exceeds byte limit".into());
+        }
         let id = identity(&bytes);
         fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
         #[cfg(unix)]
