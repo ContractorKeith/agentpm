@@ -2,3 +2,5 @@
 pub mod contracts;
 pub mod harness;
 pub mod store;
+
+pub mod context;
