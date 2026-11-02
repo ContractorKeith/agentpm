@@ -11,11 +11,17 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Err("script exceeds limit".into());
     }
     let actions: Vec<Action> = serde_json::from_slice(&bytes)?;
+    let realtime = std::env::args_os()
+        .nth(2)
+        .is_some_and(|a| a == "--realtime");
     let mut out = std::io::stdout().lock();
     for action in actions {
         if matches!(action, Action::Malformed {}) {
             writeln!(out, "{{malformed")?;
             return Ok(false);
+        }
+        if realtime && let Action::Delay { milliseconds } = &action {
+            std::thread::sleep(std::time::Duration::from_millis(*milliseconds));
         }
         let failed = matches!(action, Action::Failure { .. });
         writeln!(
