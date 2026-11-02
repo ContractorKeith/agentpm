@@ -91,6 +91,8 @@ impl GitService {
             .map_err(|e| e.to_string())?;
         db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS allocations (run TEXT NOT NULL, milestone TEXT NOT NULL, branch TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE, head TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(run,milestone)); CREATE TABLE IF NOT EXISTS handback_reports(run TEXT NOT NULL, milestone TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e| e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS human_ownership(run TEXT NOT NULL, milestone TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e|e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS execution_reservations(run TEXT NOT NULL, milestone TEXT NOT NULL, token TEXT NOT NULL UNIQUE, PRIMARY KEY(run,milestone));
+        CREATE TABLE IF NOT EXISTS handback_operations(operation TEXT PRIMARY KEY,run TEXT NOT NULL,milestone TEXT NOT NULL,report TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0);").map_err(|e|e.to_string())?;
         // BEGIN IMMEDIATE is held across external effects; persisted intents survive
         // crashes, while all cooperating CLI/supervisor instances serialize here.
         db.execute_batch("BEGIN IMMEDIATE")
@@ -332,6 +334,16 @@ impl GitService {
         if held {
             return Err("human takeover freezes branch maintenance".into());
         }
+        let reserved: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_reservations WHERE run=?1 AND milestone=?2)",
+                params![run, milestone],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if reserved {
+            return Err("execution reservation freezes branch maintenance".into());
+        }
         Ok(())
     }
     /// Cooperating callers share the same immediate transaction as cleanup.
@@ -346,7 +358,84 @@ impl GitService {
         }
         self.owned(&a)?;
         self.checkout_matches(&a)?;
+        self.expected_revision(&a)?;
         Ok(a)
+    }
+    fn expected_revision(&self, a: &Allocation) -> Result<()> {
+        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+            || self.head(&format!("refs/heads/{}", a.branch)).as_deref() != Some(&a.expected_head)
+        {
+            return Err(
+                "unexpected HEAD or branch tip; explicit revision reconciliation required".into(),
+            );
+        }
+        Ok(())
+    }
+    /// Attach the canonical claim store for SQLite's atomic multi-file commit.
+    pub fn attach(&self, db: &Connection) -> Result<()> {
+        drop(self.connection()?);
+        let names = db
+            .prepare("PRAGMA database_list")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        if names.iter().any(|n| n == "repo_claims") {
+            db.execute_batch("DETACH DATABASE repo_claims")
+                .map_err(|e| e.to_string())?;
+        }
+        db.execute(
+            "ATTACH DATABASE ?1 AS repo_claims",
+            [self
+                .common
+                .join("agentpm-claims.sqlite3")
+                .to_string_lossy()
+                .as_ref()],
+        )
+        .map_err(|e| e.to_string())?;
+        for pragma in [
+            "PRAGMA main.journal_mode",
+            "PRAGMA repo_claims.journal_mode",
+        ] {
+            let mode: String = db
+                .query_row(pragma, [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if mode != "delete" {
+                return Err("atomic cross-store reservations require DELETE journal mode".into());
+            }
+        }
+        db.execute_batch("PRAGMA main.synchronous=FULL")
+            .map_err(|e| e.to_string())?;
+        db.execute_batch("PRAGMA repo_claims.synchronous=FULL")
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn reserve_attached(&self, db: &Connection, a: &Allocation, token: &str) -> Result<()> {
+        let row:(String,String,String,String)=db.query_row("SELECT branch,path,head,state FROM repo_claims.allocations WHERE run=?1 AND milestone=?2",params![a.run,a.milestone],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e|e.to_string())?;
+        if row
+            != (
+                a.branch.clone(),
+                a.path.to_string_lossy().into_owned(),
+                a.expected_head.clone(),
+                "allocated".into(),
+            )
+        {
+            return Err("allocation changed before reservation".into());
+        }
+        let human:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM repo_claims.human_ownership WHERE run=?1 AND milestone=?2)",params![a.run,a.milestone],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if human {
+            return Err("human takeover freezes dispatch".into());
+        }
+        self.owned(a)?;
+        self.checkout_matches(a)?;
+        self.expected_revision(a)?;
+        db.execute(
+            "INSERT INTO repo_claims.execution_reservations VALUES(?1,?2,?3)",
+            params![a.run, a.milestone, token],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
     pub fn takeover(&self, run: &str, milestone: &str) -> Result<()> {
         let db = self.connection()?;
@@ -359,8 +448,24 @@ impl GitService {
         .map_err(|e| e.to_string())?;
         db.execute_batch("COMMIT").map_err(|e| e.to_string())
     }
-    pub fn handback(&self, run: &str, milestone: &str) -> Result<serde_json::Value> {
+    pub fn prepare_handback(
+        &self,
+        operation: &str,
+        run: &str,
+        milestone: &str,
+    ) -> Result<serde_json::Value> {
         let db = self.connection()?;
+        if let Some(report)=db.query_row("SELECT report FROM handback_operations WHERE operation=?1 AND run=?2 AND milestone=?3",params![operation,run,milestone],|r|r.get::<_,String>(0)).optional().map_err(|e|e.to_string())? { return serde_json::from_str(&report).map_err(|e|e.to_string()); }
+        let held: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_ownership WHERE run=?1 AND milestone=?2)",
+                params![run, milestone],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !held {
+            return Err("handback requires frozen human ownership".into());
+        }
         let a = self
             .read(&db, run, milestone)?
             .ok_or("unknown allocation")?;
@@ -383,12 +488,49 @@ impl GitService {
         )
         .map_err(|e| e.to_string())?;
         db.execute(
-            "DELETE FROM human_ownership WHERE run=?1 AND milestone=?2",
-            params![run, milestone],
+            "INSERT INTO handback_operations(operation,run,milestone,report) VALUES(?1,?2,?3,?4)",
+            params![operation, run, milestone, report.to_string()],
         )
         .map_err(|e| e.to_string())?;
         db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(report)
+    }
+    /// Called only after the supervisor's durable handback receipt is present.
+    pub fn complete_handback(
+        &self,
+        operation: &str,
+        request: &str,
+        supervisor: &Connection,
+    ) -> Result<()> {
+        let db = self.connection()?;
+        let row: Option<(String, String, bool)> = db
+            .query_row(
+                "SELECT run,milestone,completed FROM handback_operations WHERE operation=?1",
+                [operation],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some((run, milestone, false)) = row {
+            let committed:bool=supervisor.query_row("SELECT EXISTS(SELECT 1 FROM supervisor_requests q JOIN execution_controls c ON c.run=?2 WHERE q.id=?1 AND json_extract(q.command,'$.kind')='handback' AND json_extract(q.command,'$.run')=?2 AND c.milestone=?3 AND c.human=0)",params![request,run,milestone],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !committed {
+                return Err(
+                    "handback has no committed supervisor ownership/evidence receipt".into(),
+                );
+            }
+
+            db.execute(
+                "DELETE FROM human_ownership WHERE run=?1 AND milestone=?2",
+                params![run, milestone],
+            )
+            .map_err(|e| e.to_string())?;
+            db.execute(
+                "UPDATE handback_operations SET completed=1 WHERE operation=?1",
+                [operation],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        db.execute_batch("COMMIT").map_err(|e| e.to_string())
     }
     pub fn inspect(&self, run: &str, milestone: &str) -> Result<Allocation> {
         let db = self.connection()?;

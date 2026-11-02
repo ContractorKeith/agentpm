@@ -10,7 +10,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
-fn run() -> Result<String, String> {
+fn run(complete: &mut bool) -> Result<String, String> {
     unsafe {
         libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
@@ -22,6 +22,10 @@ fn run() -> Result<String, String> {
         .ok_or("missing deadline")?
         .parse()
         .map_err(|_| "invalid deadline")?;
+    if let Some(path) = args.get(4) {
+        std::fs::write(Path::new(path).with_extension("ready"), b"ready")
+            .map_err(|e| e.to_string())?;
+    }
     let started = Instant::now();
     let mut input = std::io::stdin();
     let fd = input.as_raw_fd();
@@ -65,16 +69,34 @@ fn run() -> Result<String, String> {
         "-",
         &std::env::var("AGENTPM_EXECUTION_ID").map_err(|e| e.to_string())?,
     )?;
-    agentpm::process::finish_with_grace(
+    let evidence = agentpm::process::finish_with_grace_evidence(
         child,
         &bytes,
         Duration::from_millis(timeout).saturating_sub(started.elapsed()),
         Duration::from_millis(50),
         || STOP.load(Ordering::Relaxed),
-    )
+    );
+    *complete = evidence.complete;
+    evidence.result
 }
 fn main() {
-    match run() {
+    let start = Instant::now();
+    let mut complete = true;
+    let result = run(&mut complete);
+    if let Some(path) = std::env::args().nth(4) {
+        let receipt = agentpm::receipt::Receipt {
+            token: std::env::var("AGENTPM_EXECUTION_ID").unwrap_or_default(),
+            snapshot_hash: std::env::args().nth(3).unwrap_or_default(),
+            complete,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            result: result.clone(),
+        };
+        if let Err(e) = receipt.publish(Path::new(&path)) {
+            eprintln!("persist guardian receipt: {e}");
+            std::process::exit(2);
+        }
+    }
+    match result {
         Ok(result) => {
             let (kind, code) = if result.starts_with("succeeded") {
                 ("success", 0)

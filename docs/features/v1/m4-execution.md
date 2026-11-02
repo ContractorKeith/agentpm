@@ -1,94 +1,122 @@
 # M4 execution controls and usage evidence
 
-The actual `supervisor::Command` service and `agentpm run` CLI enforce limits on
-M1 fake runs. Schema 4 preserves v2/v3 rows and immutable scripts. Unknown
-historical inputs are never invented. Each fake run is one logical task;
-repairs use the same run and input, consume one of three repair attempts, and
-retain elapsed time. Replan commands consume one of three durable run credits;
-no coordinator/task-graph scheduler exists yet. Mutations use durable request
-IDs; exact retries do not launch or spend twice. A new run is a separately
-submitted specification, never the implementation of a replacement task.
+The real `supervisor::Command` service and `agentpm run` CLI enforce durable
+execution limits. Schema 5 migrates earlier records without inventing scripts,
+process identities or completion evidence. Repairs retain the run, immutable
+input, consumed time and three repair credits. Three run replan credits also
+survive restart. Exact mutation retries never launch or spend twice.
 
-`run start SCRIPT --command-id RUN` retains the two-hour default. For tests or
-explicit lower limits, `run start-controlled SCRIPT --command-id RUN --project P
---allowance-ms 1000` uses the same launch path. `run controls RUN` shows consumed
-milliseconds, allowance, stop/identity/human ownership flags, repair/replan
-counts and explicitly unknown usage. `run policy SLOTS PROJECT_CAP --command-id
-ID` lowers global/default project limits (1–3); `run project-cap PROJECT CAP
---command-id ID` records an individual project cap. Admission reserves queued
-intents as well as live processes; unresolved restart identities retain slots.
-No fair scheduler or coordinator dispatch is claimed in this fake-run slice.
+## Dispatch, reservations and revisions
 
-`run cancel RUN --command-id ID` requests cancellation. The owner sends TERM,
-waits a bounded grace, then KILLs its still-reserved worker group before reaping. Input,
-stdout and stderr progress together under nonblocking bounded work per tick;
-retained output is bounded at 64 KiB per stream. Escaped descendants cannot
-hold completion open through inherited pipes. Only the live Child owner signals
-its unreaped group, never a database PID.
+`run start SCRIPT --command-id RUN` retains the two-hour default.
+`run start-controlled SCRIPT --command-id RUN --project P --allowance-ms 1000`
+uses the same path with an explicit allowance. `run controls RUN` shows elapsed
+time, allowance, ownership/uncertainty and counters; usage remains explicitly
+unknown when the backend does not report it.
 
-A separate `execution-guard` sibling binary owns the actual fake worker and
-keeps its deadline after service death. It accepts at most 64 KiB under a two
-second input deadline (also bounded by the execution deadline), verifies the
-snapshotted SHA-256 before launching, and gives the worker 50 ms shutdown grace.
-The service requests guardian shutdown and waits up to 200 ms. If shutdown is
-unconfirmed it retains an uncertain slot instead of killing the guardian while
-it may hold a worker. The guardian owns the worker group and its 50 ms grace. The
-recorded PID identifies the guardian. Install all three binaries together.
-Killing the guardian independently, escaping process groups, or same-user
-metadata tampering is outside this cooperative ownership guarantee.
+`run policy SLOTS PROJECT_CAP --command-id ID` sets global/default worker caps
+(1–3); `run project-cap PROJECT CAP --command-id ID` sets an individual cap.
+Worker identities reserve slots before launch. Coordinator identities have a
+separate per-run limit of one; they do not consume worker slots. Waiting
+identities consume neither active time nor a slot.
 
-A monotonic interval is checkpointed during execution and on completion.
-Sequential repairs add to the retained run total. Terminal/blocked and human
-waits consume no time. The current fake supervisor has one execution per run,
-so its active union is exactly that execution interval; parallel runs have
-independent budgets. Multiple workers/coordinator within one run are not yet
-dispatchable and must share this run allowance when M8 supplies scheduling.
-Restart cannot reconnect the fake adapter: it transactionally exhausts uncertain
-allowances, retains slots, and emits a deduplicated recovery attention event.
-It never signals stored PIDs, releases uncertain claims, or replays prompts.
-This conservative policy may overcharge downtime. There is no automated slot
-release or adoption for uncertain runs; manual reconciliation is still required.
+For owned worktrees, allocate through M3 using the same RUN, then pass
+`--repository REPO --milestone M` to start-controlled. Before start, repair or
+resume, ownership, registered checkout, symbolic branch, HEAD and branch tip
+must match the recorded expected revision. Unexpected commits require explicit
+revision reconciliation, never automatic adoption.
 
-`run repair RUN --command-id ID` dispatches the immutable input again, within
-remaining time and repair credits. `run extend RUN MILLISECONDS --command-id ID`
-records a human extension for a stopped/terminal run without resetting consumed
-time or counters. `run resume RUN --command-id ID` is an explicit human replay
-of a known terminal attempt, not an autonomous repair-credit reset. Unknown
-identity or exhausted allowance blocks replay. Future agent/MCP adapters must
-not expose extension or human resume as autonomous authority.
+A canonical repository reservation and supervisor launch intent commit in one
+SQLite attached-database immediate transaction. Both stores require DELETE
+journals and FULL synchronization for atomic multi-file rollback. Allocation
+retries and independent cooperating cleanup commands check this reservation
+under the same canonical claim lock. It remains through queued, running,
+shutdown and uncertain states, until authoritative completion commits alongside
+its release. A failed launch-intent transaction rolls back both stores. Old
+bound uncertain executions receive a conservative reservation during recovery.
+Worktrees and these locks are cooperative controls, not an OS sandbox.
 
-For takeover, first allocate an M3 worktree with the same RUN ID, then use
-`start-controlled ... --repository REPO --milestone M`. The worker cwd and Git
-binding are recorded. `run takeover RUN --command-id ID` freezes the repository
-claim under M3's immediate transaction, requests shutdown, and confirms exclusive
-human ownership only after the execution owner finishes. Failure to confirm
-leaves maintenance frozen and returns a pending diagnostic. Unknown recovery
-identities cannot be granted exclusive ownership.
+## Shared active union
 
-Allocation retries and cleanup obey the same repository-local freeze, including
-independent cooperating CLI processes. `run handback RUN --command-id ID`
-inspects HEAD, symbolic branch and tracked/untracked/ignored status, persists its
-inspection in the repository claim database, and records an evidence-invalidated
-event before returning. It never adopts human commits as the expected revision.
-Dirty/changed branches remain protected by M3 checks; replay rechecks ownership.
-No product review evidence exists in fake runs; M9 must consume revalidation
-requirements when its evidence pipeline exists. These controls do not sandbox
-other tools running as the same user.
+`execution::{reserve_at, transition_at, tick_at, recover_clock}` is the shared
+persistent execution-identity/clock primitive for supervisor dispatch and M8.
+The caller holds the supervisor transaction. Each identity records its run,
+project, role, state and unique token. Live stamps use a process-wide monotonic
+clock and epoch; deterministic tests supply exact stamps through the same API.
+Every set transition checkpoints the run before changing membership. A run is
+charged once while any identity is active, regardless of worker/coordinator
+overlap; all-waiting intervals are excluded. Waiting activation rechecks slots,
+coordinator ownership and the shared remaining budget. Finished identities
+cannot be reused. Task replacement must retain the run and its allowance.
 
-## Local verification
+The existing fake dispatch registers, activates, checkpoints and finishes through
+this primitive. M8 supplies the scheduling graph and consumes the same ledger;
+it does not introduce another clock or reset counters. Restart preserves the
+maximum recorded time, changes clock epoch explicitly, and conservatively
+charges unknown active intervals. Known waiting intervals stay excluded.
 
-`cargo test --workspace --locked` preserves the 34 pre-M4 tests and adds five
-supervisor/process integration scenarios (39 total). They cover real temporary
-Git takeover/handback with preserved edits; short-budget exhaustion; global and
-project admission; cancellation; three actual repair dispatches and three replan
-credits with restart persistence; service crash without duplicate dispatch;
-guardian deadline/reaping; blocked stdin; and an escaped pipe holder. The schema
-upgrade test now expects version 4 while retaining unknown v2 script bytes.
-The guardian test uses a one-second deadline to include macOS process startup;
-subsecond tests target already-owned process I/O rather than require a worker to
-finish startup inside 120 ms.
+## Process ownership and recovery
 
-Required local gates: fmt, locked clippy with warnings denied, locked workspace
-tests, and locked release build. This is local macOS evidence only. Linux CI,
-independent attack/review, production backend capability tests and release
-acceptance remain separate. No paid API, product merge or deployment occurs.
+`run cancel RUN --command-id ID` requests shutdown. Nonblocking stdin/stdout/
+stderr progress under bounded work per tick and deadlines; each retained output
+stream is limited to 64 KiB. Escaped pipe holders cannot hold completion open.
+Only live owners signal reserved, unreaped identities. Setup and wait errors
+retain the Child until safe cleanup/reap or return explicit ownership uncertainty.
+Stop/continue notifications are not mistaken for process exit.
+
+The `execution-guard` sibling owns the actual worker. It verifies snapshot
+SHA-256 before launch and retains the worker deadline across service death. It
+installs cancellation handling before advertising readiness, gives the worker
+50 ms grace, then kills its proven group and reaps before publishing completion.
+The service waits up to 200 ms for guardian shutdown; if unconfirmed it retains
+uncertainty rather than killing the guardian holding a separate worker group.
+Install agentpm, fake-agent and execution-guard together.
+
+Completion receipts are private, bounded, nonce/hash-bound records published
+with file and directory synchronization after cleanup. Their recorded identity
+and snapshot must match the durable attempt. Reconciliation never infers
+ownership or completion from a reusable PID or an elapsed timer. It consumes
+confirmed receipts, records the outcome, preserves maximum elapsed time, clears
+uncertainty and atomically releases the worker slot/repository reservation.
+Reconciliation runs before commands/admission and at startup; it is also exposed
+as `run reconcile RUN --command-id ID`. If a guardian is still finishing, a later
+reconcile consumes its receipt. Unknowable historical executions stay escalated
+and reserved. Missing evidence is never fabricated or treated as completion.
+
+`run repair RUN --command-id ID` dispatches again within remaining credits/time.
+`run extend RUN MILLISECONDS --command-id ID` records an explicit human allowance
+extension for a stopped/terminal run. `run resume RUN --command-id ID` explicitly
+replays a known terminal attempt; it does not reset consumed time or autonomous
+counters. Agent/MCP interfaces must not grant these human-only authorities.
+
+## Takeover and handback
+
+`run takeover RUN --command-id ID` freezes the repository claim, requests worker
+shutdown and confirms human ownership only after executions end. Unconfirmed
+shutdown keeps the freeze and returns a pending diagnostic. Unknown identities
+cannot grant exclusive ownership.
+
+`run handback RUN --command-id ID` persists an operation and its first inspection
+of HEAD, symbolic branch and tracked/untracked/ignored changes while keeping the
+freeze. The operation is namespaced by supervisor database and request identity.
+The supervisor then commits human ownership transfer, evidence invalidation and
+the idempotent request receipt. Only that committed receipt permits repository
+unfreeze. Abort/retry/crash paths preserve the first inspection; post-commit
+unfreeze failures are reconciled from the durable receipt on retry or restart.
+Human commits are not adopted as expected revisions, and dirty work is preserved.
+
+## Verification
+
+All 39 pre-correction tests remain. Eleven correction regressions add real
+supervisor/Git/process fault coverage and deterministic durable-clock coverage:
+unexpected start/repair/resume revisions; independent maintenance during queued
+or uncertain shutdown; launch cross-store rollback; injected human=0 handback
+abort and post-commit unfreeze failure with restart; guardian-backed slot release
+while the stored PID names an unrelated process; unknown historical preservation;
+setup/missing-pipe/wait failures; overlap, coordinator slots, waits, exhaustion
+and restart; and the recorded 750 ms / 500 ms allowance recovery probe.
+
+Required local gates are fmt, locked clippy with warnings denied, all locked
+workspace tests (50 total), and locked release build. Local results establish
+macOS behavior. Linux CI and fresh independent review remain primary integration
+gates. No paid backend, product merge, release or deployment is exercised.

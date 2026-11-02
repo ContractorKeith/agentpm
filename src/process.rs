@@ -81,7 +81,11 @@ fn exited_unreaped(child: &Child) -> Result<bool, String> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    Ok(unsafe { info.si_pid() } != 0)
+    Ok(unsafe { info.si_pid() } != 0
+        && matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ))
 }
 pub fn finish(child: Child) -> Result<String, String> {
     finish_with_timeout(child, Duration::from_secs(30))
@@ -112,7 +116,9 @@ pub fn finish_guard(
         Duration::from_millis(200),
         false,
         cancel,
+        exited_unreaped,
     )
+    .map_err(|e| e.message)
 }
 pub fn finish_with_grace(
     child: Child,
@@ -121,7 +127,92 @@ pub fn finish_with_grace(
     grace: Duration,
     cancel: impl FnMut() -> bool,
 ) -> Result<String, String> {
-    finish_owner(child, input, timeout, grace, true, cancel)
+    finish_owner(child, input, timeout, grace, true, cancel, exited_unreaped).map_err(|e| e.message)
+}
+#[derive(Debug)]
+struct ProcessError {
+    message: String,
+    uncertain: bool,
+}
+impl From<String> for ProcessError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            uncertain: false,
+        }
+    }
+}
+impl From<&str> for ProcessError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl ProcessError {
+    fn uncertain(message: String) -> Self {
+        Self {
+            message,
+            uncertain: true,
+        }
+    }
+}
+pub struct OwnedResult {
+    pub result: Result<String, String>,
+    pub complete: bool,
+}
+/// Ownership certainty is typed, independent of untrusted protocol diagnostics.
+pub fn finish_with_grace_evidence(
+    child: Child,
+    input: &[u8],
+    timeout: Duration,
+    grace: Duration,
+    cancel: impl FnMut() -> bool,
+) -> OwnedResult {
+    match finish_owner(child, input, timeout, grace, true, cancel, exited_unreaped) {
+        Ok(v) => OwnedResult {
+            result: Ok(v),
+            complete: true,
+        },
+        Err(e) => OwnedResult {
+            complete: !e.uncertain,
+            result: Err(e.message),
+        },
+    }
+}
+// Error paths retain the Child until cleanup/reap succeeds. A failed ownership
+// probe never authorizes a signal to a potentially reused numeric identity.
+fn cleanup_error(mut child: Child, reason: String, kill_worker: bool) -> ProcessError {
+    if !kill_worker {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return ProcessError::uncertain(format!("{reason}; execution identity uncertain"));
+    }
+    if exited_unreaped(&child).is_err() {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return ProcessError::uncertain(format!("{reason}; execution identity uncertain"));
+    }
+    let pgid = unsafe { libc::getpgid(child.id() as i32) };
+    let killed = if pgid == child.id() as i32 {
+        (unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) }) == 0
+    } else {
+        child.kill().is_ok()
+    };
+    if !killed && !exited_unreaped(&child).unwrap_or(false) {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return ProcessError::uncertain(format!(
+            "{reason}; cleanup denied; execution identity uncertain"
+        ));
+    }
+    match child.wait() {
+        Ok(_) => reason.into(),
+        Err(e) => ProcessError::uncertain(format!(
+            "{reason}; reap failed: {e}; execution identity uncertain"
+        )),
+    }
 }
 fn finish_owner(
     mut child: Child,
@@ -130,16 +221,34 @@ fn finish_owner(
     grace: Duration,
     kill_on_timeout: bool,
     mut cancel: impl FnMut() -> bool,
-) -> Result<String, String> {
+    mut probe: impl FnMut(&Child) -> Result<bool, String>,
+) -> Result<String, ProcessError> {
     use std::io::Write;
-    let mut stdout = child.stdout.take().ok_or("missing stdout")?;
-    let mut stderr = child.stderr.take().ok_or("missing stderr")?;
-    nonblocking(&stdout)?;
-    nonblocking(&stderr)?;
-    let mut stdin = child.stdin.take();
-    if let Some(stream) = &stdin {
-        nonblocking(stream)?;
+    // Darwin can hide a zombie PGID even while WNOWAIT reserves its identity.
+    if unsafe { libc::getpgid(child.id() as i32) } != child.id() as i32
+        && !exited_unreaped(&child).unwrap_or(false)
+    {
+        return Err(cleanup_error(
+            child,
+            "child is not its owned group leader".into(),
+            kill_on_timeout,
+        ));
     }
+    let mut setup = || -> Result<_, String> {
+        let stdout = child.stdout.take().ok_or("missing stdout")?;
+        let stderr = child.stderr.take().ok_or("missing stderr")?;
+        nonblocking(&stdout)?;
+        nonblocking(&stderr)?;
+        let stdin = child.stdin.take();
+        if let Some(stream) = &stdin {
+            nonblocking(stream)?;
+        }
+        Ok((stdout, stderr, stdin))
+    };
+    let (mut stdout, mut stderr, mut stdin) = match setup() {
+        Ok(v) => v,
+        Err(e) => return Err(cleanup_error(child, e, kill_on_timeout)),
+    };
     let mut offset = 0;
     let (mut bytes, mut diagnostic) = (Vec::new(), Vec::new());
     let (mut overflow, mut truncated) = (false, false);
@@ -160,7 +269,10 @@ fn finish_owner(
                 stdin = None;
             }
         }
-        let exited = exited_unreaped(&child)?;
+        let exited = match probe(&child) {
+            Ok(v) => v,
+            Err(e) => return Err(cleanup_error(child, e, kill_on_timeout)),
+        };
         if exited {
             break true;
         }
@@ -182,7 +294,9 @@ fn finish_owner(
         thread::spawn(move || {
             let _ = child.wait();
         });
-        return Err("guardian shutdown unconfirmed; execution identity uncertain".into());
+        return Err(ProcessError::uncertain(
+            "guardian shutdown unconfirmed; execution identity uncertain".into(),
+        ));
     }
     let signal = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let signal_error = if signal != 0 {
@@ -190,12 +304,25 @@ fn finish_owner(
     } else {
         None
     };
-    let status = child.wait().map_err(|e| e.to_string())?;
+    if let Some(e) = &signal_error
+        && e.raw_os_error() != Some(libc::ESRCH)
+        && !(cfg!(target_os = "macos") && exited && e.raw_os_error() == Some(libc::EPERM))
+    {
+        return Err(cleanup_error(
+            child,
+            format!("group termination failed: {e}"),
+            kill_on_timeout,
+        ));
+    }
+    let status = match child.wait() {
+        Ok(v) => v,
+        Err(e) => return Err(cleanup_error(child, e.to_string(), kill_on_timeout)),
+    };
     if let Some(e) = signal_error {
         let zombie_only =
             cfg!(target_os = "macos") && exited && e.raw_os_error() == Some(libc::EPERM);
         if e.raw_os_error() != Some(libc::ESRCH) && !zombie_only {
-            return Err(e.to_string());
+            return Err(e.to_string().into());
         }
     }
     collect(&mut stdout, &mut bytes, &mut overflow);
@@ -244,7 +371,7 @@ fn finish_owner(
                 String::from_utf8_lossy(&bytes)
             )
         })
-        .map_err(|e| format!("{e}; {diagnostics}"))
+        .map_err(|e| ProcessError::from(format!("{e}; {diagnostics}")))
 }
 
 /// A separate guardian survives service death and retains the worker Child.
@@ -254,6 +381,7 @@ pub fn launch_guard(
     cwd: Option<&Path>,
     allowance_ms: u64,
     input: &[u8],
+    receipt: Option<&Path>,
 ) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
     let guard = std::env::current_exe()
@@ -272,6 +400,9 @@ pub fn launch_guard(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(receipt) = receipt {
+        command.arg(receipt);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -281,6 +412,67 @@ pub fn launch_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_and_wait_errors_cleanup_real_children() {
+        use std::os::unix::process::CommandExt;
+        for mode in 0..4 {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("10");
+            if mode != 3 {
+                command.process_group(0);
+            }
+            if mode != 0 {
+                command.stdout(Stdio::piped());
+            }
+            if mode != 1 {
+                command.stderr(Stdio::piped());
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let result = if mode == 2 {
+                finish_owner(
+                    child,
+                    &[],
+                    Duration::from_secs(1),
+                    Duration::from_millis(10),
+                    true,
+                    || false,
+                    |_| Err("injected waitid error".into()),
+                )
+                .map_err(|e| e.message)
+            } else {
+                finish(child)
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo 'identity uncertain' >&2; exit 2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let evidence = finish_with_grace_evidence(
+            child,
+            &[],
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || false,
+        );
+        assert!(evidence.result.unwrap_err().contains("identity uncertain"));
+        assert!(
+            evidence.complete,
+            "diagnostic text must not change ownership certainty"
+        );
+    }
     #[test]
     fn exit_is_observed_without_releasing_identity_until_group_cleanup() {
         use std::os::unix::process::CommandExt;

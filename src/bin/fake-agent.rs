@@ -41,7 +41,59 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
     Ok(true)
 }
+// Adversarial process fixture: fork only after exec has closed spawn's error pipe.
+fn escaped_pipe_fixture(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            if libc::setsid() < 0 {
+                libc::_exit(2);
+            }
+            let ready = 1u8;
+            libc::write(pipe[1], (&ready as *const u8).cast(), 1);
+            libc::close(pipe[1]);
+            libc::sleep(2);
+            libc::_exit(0);
+        }
+    }
+    let mut ready = 0u8;
+    unsafe {
+        libc::close(pipe[1]);
+    }
+    let read = unsafe { libc::read(pipe[0], (&mut ready as *mut u8).cast(), 1) };
+    unsafe {
+        libc::close(pipe[0]);
+    }
+    if read != 1 || ready != 1 {
+        return Err("escaped fixture failed to detach".into());
+    }
+    std::fs::write(path, pid.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string(&FakeMessage {
+            protocol_version: 1,
+            action: Action::Success {}
+        })?
+    );
+    Ok(())
+}
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--fixture-escaped-pipes") {
+        let path = std::env::args_os().nth(2).expect("fixture pid file");
+        if let Err(e) = escaped_pipe_fixture(std::path::Path::new(&path)) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     match run() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),

@@ -1,6 +1,6 @@
 //! Initial transactional migration, not a supervisor persistence implementation.
 use rusqlite::{Connection, Result};
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;

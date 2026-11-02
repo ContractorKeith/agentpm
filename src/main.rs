@@ -58,6 +58,11 @@ enum RunCommand {
     Show {
         run: String,
     },
+    Reconcile {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
     Controls {
         run: String,
     },
@@ -289,6 +294,9 @@ fn run() -> Result<bool, String> {
                             command_id,
                         },
                 } => (command_id, ServiceCommand::ProjectCap { project, cap }),
+                Commands::Run {
+                    command: RunCommand::Reconcile { run, command_id },
+                } => (command_id, ServiceCommand::Reconcile { run }),
                 Commands::Run {
                     command: RunCommand::Controls { run },
                 } => ("controls".into(), ServiceCommand::Controls { run }),

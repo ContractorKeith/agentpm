@@ -79,6 +79,9 @@ pub enum Command {
     Events {
         cursor: u64,
     },
+    Reconcile {
+        run: String,
+    },
     Status {},
 }
 fn error(e: impl std::fmt::Display) -> String {
@@ -104,6 +107,8 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
     crate::contracts::RequestId::new(&request.id)?;
     let encoded = serde_json::to_string(&request.command).map_err(error)?;
     let mut conn = db.lock().map_err(error)?;
+    reconcile(&mut conn)?;
+    reconcile_handbacks(&conn)?;
     if !matches!(
         request.command,
         Command::Status {}
@@ -150,7 +155,11 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             (Some(repo), Some(milestone)) => {
                 let service = crate::git::GitService::open(Path::new(repo))?;
                 let a = service.execution_checkout(&request.id, milestone)?;
-                Some((repo.clone(), milestone.clone(), a.path))
+                Some((
+                    a.repository.to_string_lossy().into_owned(),
+                    milestone.clone(),
+                    a,
+                ))
             }
             (None, None) => None,
             _ => return Err("repository and milestone must be supplied together".into()),
@@ -170,7 +179,8 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
         Command::Takeover { run } | Command::Handback { run } => {
             let (repository, milestone, uncertain): (Option<String>,Option<String>,bool) = conn.query_row("SELECT repository,milestone,uncertain FROM execution_controls WHERE run=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(error)?;
             if uncertain { return Err("unknown execution identity requires human reconciliation; exclusive ownership cannot be proven".into()); }
-            let service = crate::git::GitService::open(Path::new(&repository.ok_or("run has no worktree binding")?))?;
+            let repository=repository.ok_or("run has no worktree binding")?;
+            let service = crate::git::GitService::open(Path::new(&repository))?;
             let milestone = milestone.ok_or("run has no milestone binding")?;
             let handback = is_handback;
             if handback {
@@ -185,7 +195,7 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
                 let deadline = Instant::now()+Duration::from_secs(2);
                 loop {
                     let conn = db.lock().map_err(error)?;
-                    let active: bool = conn.query_row("SELECT state IN ('queued','running') FROM fake_runs WHERE id=?1",[&run],|r|r.get(0)).map_err(error)?;
+                    let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM execution_identities WHERE run=?1 AND state!='finished') OR EXISTS(SELECT 1 FROM fake_runs f WHERE id=?1 AND state IN ('queued','running') AND NOT EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=f.id))",[&run],|r|r.get(0)).map_err(error)?;
                     if !active { break; }
                     if Instant::now()>=deadline { return Err("takeover pending; maintenance frozen; worker shutdown unconfirmed".into()); }
                     drop(conn);
@@ -193,14 +203,17 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
                 }
                 conn = db.lock().map_err(error)?;
             }
+            let report = if handback { service.prepare_handback(&handback_operation(&conn,&request.id)?,&run,&milestone)? } else { json!({"human_owned":true}) };
             let tx = conn.transaction().map_err(error)?;
-            let report = if handback { service.handback(&run,&milestone)? } else { json!({"human_owned":true}) };
             tx.execute("UPDATE execution_controls SET human=?2 WHERE run=?1",params![run,!handback]).map_err(error)?;
             event(&tx,&run,json!({"kind":if handback {"handback_evidence_invalidated"} else {"human_takeover"},"inspection":report}))?;
             tx.execute("INSERT INTO supervisor_requests VALUES(?1,?2,?3)",params![request.id,encoded,report.to_string()]).map_err(error)?;
+            if handback {tx.execute("INSERT INTO handback_transfers VALUES(?1,?2,?3,1)",params![request.id,handback_operation(&tx,&request.id)?,repository]).map_err(error)?;}
             tx.commit().map_err(error)?;
+            if handback { reconcile_handbacks(&conn)?; }
             Ok(report)
         },
+        Command::Reconcile { run } => crate::execution::show(&conn,&run),
         Command::Controls { run } => crate::execution::show(&conn, &run),
         Command::Cancel { ref run } | Command::Replan { ref run } => {
             let tx = conn.transaction().map_err(error)?;
@@ -240,21 +253,24 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             let (state, bytes, cwd, executable): (String,Option<Vec<u8>>,String,String) = conn.query_row("SELECT state,script_bytes,cwd,executable FROM fake_runs WHERE id=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(error)?;
             if state != "failed" && state != "finished" { return Err("attempt is still active".into()); }
             let (repo,milestone): (Option<String>,Option<String>) = conn.query_row("SELECT repository,milestone FROM execution_controls WHERE run=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
-            if let (Some(repo),Some(milestone)) = (repo,milestone) { crate::git::GitService::open(Path::new(&repo))?.execution_checkout(&run,&milestone)?; }
+            let binding=if let (Some(repo),Some(milestone))=(repo,milestone) { let service=crate::git::GitService::open(Path::new(&repo))?; let a=service.execution_checkout(&run,&milestone)?; service.attach(&conn)?; Some((service,a)) } else {None};
             let bytes = bytes.ok_or("historical input unknown; cannot replay")?;
             let used = controls["used_ms"].as_u64().ok_or("unknown used time")?;
             let allowance = controls["allowance_ms"].as_u64().ok_or("unknown allowance")?;
             if used>=allowance { return Err("execution budget exhausted".into()); }
-            let tx = conn.transaction().map_err(error)?;
+            let token=crate::execution::nonce()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
+            if let Some((service,a))=&binding { service.reserve_attached(&tx,a,&token)?; }
             if !is_resume && tx.execute("UPDATE execution_controls SET repairs=repairs+1 WHERE run=?1 AND repairs<3",[&run]).map_err(error)? != 1 { return Err("repair limit exhausted".into()); }
             if is_resume { tx.execute("UPDATE execution_controls SET stop=0 WHERE run=?1",[&run]).map_err(error)?; }
-            tx.execute("UPDATE fake_runs SET state='queued',pid=NULL,result=NULL,session=?2 WHERE id=?1",params![run,request.id]).map_err(error)?;
+            tx.execute("UPDATE fake_runs SET state='queued',pid=NULL,result=NULL,session=?2 WHERE id=?1",params![run,token]).map_err(error)?;
+            register_attempt(&tx,&run,project,&token,&bytes)?;
             let response = crate::execution::show(&tx,&run)?;
-            event(&tx,&run,json!({"kind":"repair_intent","controls":response}))?;
+            event(&tx,&run,json!({"kind":"repair_intent","controls":response,"execution":token,"human_resume":is_resume}))?;
             tx.execute("INSERT INTO supervisor_requests VALUES(?1,?2,?3)",params![request.id,encoded,response.to_string()]).map_err(error)?;
             tx.commit().map_err(error)?;
             drop(conn);
-            dispatch(db,PathBuf::from(executable),run,bytes,Some(PathBuf::from(cwd)),allowance,used);
+            dispatch(db,Dispatch {exe:PathBuf::from(executable),run,bytes,cwd:Some(PathBuf::from(cwd)),token});
             Ok(response)
         },
         Command::ProjectCap { project, cap } => {
@@ -282,50 +298,234 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             let bytes = snapshot(&script)?;
             let run = request.id;
             let response = json!({"version":1,"run":run,"state":"queued"});
-            let tx = conn.transaction().map_err(error)?;
-            tx.execute("INSERT INTO fake_runs(id,state,result,operation,pid,session,cwd,executable,created_at,script_bytes) VALUES(?1,'queued',NULL,?1,NULL,?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4)", params![run,binding.as_ref().map(|b|b.2.clone()).unwrap_or(std::env::current_dir().map_err(error)?).to_string_lossy(),exe.to_string_lossy(),bytes]).map_err(error)?;
+            let token=crate::execution::nonce()?;
+            if let Some((repo,_,_))=&binding {crate::git::GitService::open(Path::new(repo))?.attach(&conn)?;}
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
+            if let Some((repo,_,a))=&binding { crate::git::GitService::open(Path::new(repo))?.reserve_attached(&tx,a,&token)?; }
+            tx.execute("INSERT INTO fake_runs(id,state,result,operation,pid,session,cwd,executable,created_at,script_bytes) VALUES(?1,'queued',NULL,?1,NULL,?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4)", params![run,binding.as_ref().map(|b|b.2.path.clone()).unwrap_or(std::env::current_dir().map_err(error)?).to_string_lossy(),exe.to_string_lossy(),bytes]).map_err(error)?;
             tx.execute("INSERT INTO execution_controls(run,project,allowance_ms) VALUES(?1,?2,?3)",params![run,project,allowance as i64]).map_err(error)?;
             if let Some((repo,milestone,_)) = &binding {
                 tx.execute("UPDATE execution_controls SET repository=?2,milestone=?3 WHERE run=?1",params![run,repo,milestone]).map_err(error)?;
             }
-            event(&tx,&run,json!({"kind":"launch_intent","operation":run,"session":run}))?;
+            tx.execute("UPDATE fake_runs SET session=?2 WHERE id=?1",params![run,token]).map_err(error)?;
+            register_attempt(&tx,&run,&project,&token,&bytes)?;
+            event(&tx,&run,json!({"kind":"launch_intent","operation":run,"session":token}))?;
             tx.execute("INSERT INTO supervisor_requests VALUES(?1,?2,?3)",params![run,encoded,response.to_string()]).map_err(error)?;
             tx.commit().map_err(error)?;
             drop(conn);
-            dispatch(db, exe, run, bytes, binding.map(|b|b.2), allowance, 0);
+            dispatch(db,Dispatch {exe,run,bytes,cwd:binding.map(|b|b.2.path),token});
             Ok(response)
         }
     }
 }
-fn dispatch(
-    db: Arc<Mutex<Connection>>,
+fn register_attempt(
+    db: &Connection,
+    run: &str,
+    project: &str,
+    token: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    crate::execution::reserve_at(db, run, project, token, "worker", crate::execution::now())?;
+    let database = Path::new(db.path().ok_or("missing supervisor database path")?)
+        .canonicalize()
+        .map_err(error)?;
+    let path = database
+        .parent()
+        .ok_or("missing data directory")?
+        .join("receipts")
+        .join(format!("{token}.json"));
+    db.execute(
+        "UPDATE execution_identities SET receipt_path=?2,snapshot_hash=?3 WHERE token=?1",
+        params![
+            token,
+            path.to_string_lossy(),
+            format!("{:x}", Sha256::digest(bytes))
+        ],
+    )
+    .map_err(error)?;
+    Ok(())
+}
+fn recover_reservations(conn: &mut Connection) -> Result<(), String> {
+    let rows=conn.prepare("SELECT f.id,f.session,c.repository,c.milestone FROM fake_runs f JOIN execution_controls c ON c.run=f.id WHERE f.state IN ('queued','running') AND c.repository IS NOT NULL AND c.milestone IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
+    for (run, token, repo, milestone) in rows {
+        crate::git::GitService::open(Path::new(&repo))?.attach(conn)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(error)?;
+        tx.execute("INSERT OR IGNORE INTO repo_claims.execution_reservations(run,milestone,token) SELECT run,milestone,?3 FROM repo_claims.allocations WHERE run=?1 AND milestone=?2",params![run,milestone,token]).map_err(error)?;
+        tx.commit().map_err(error)?;
+    }
+    Ok(())
+}
+fn handback_operation(db: &Connection, request: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let path = Path::new(db.path().ok_or("missing supervisor database")?)
+        .canonicalize()
+        .map_err(error)?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(path, request)).map_err(error)?)
+    ))
+}
+fn reconcile_handbacks(db: &Connection) -> Result<(), String> {
+    let rows = db
+        .prepare("SELECT request_id,operation,repository FROM handback_transfers WHERE pending=1")
+        .map_err(error)?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(error)?;
+    for (request, operation, repo) in rows {
+        crate::git::GitService::open(Path::new(&repo))?
+            .complete_handback(&operation, &request, db)?;
+        db.execute(
+            "UPDATE handback_transfers SET pending=0 WHERE request_id=?1",
+            [request],
+        )
+        .map_err(error)?;
+    }
+    Ok(())
+}
+/// Receipts are guardian-owned, nonce/hash-bound, and only published after cleanup.
+fn reconcile(conn: &mut Connection) -> Result<(), String> {
+    let rows=conn.prepare("SELECT i.token,i.run,i.receipt_path,i.snapshot_hash,i.baseline_ms,c.repository FROM execution_identities i JOIN execution_controls c ON c.run=i.run WHERE i.state!='finished' AND i.receipt_path IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
+    for (token, run, path, hash, baseline, repo) in rows {
+        let Some(receipt) = crate::receipt::Receipt::read(Path::new(&path), &token, &hash)? else {
+            continue;
+        };
+        if !receipt.complete {
+            continue;
+        }
+        if let Some(repo) = &repo {
+            crate::git::GitService::open(Path::new(repo))?.attach(conn)?;
+        }
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(error)?;
+        crate::execution::transition_at(&tx, &token, "finished", crate::execution::now())?;
+        tx.execute("UPDATE execution_controls SET used_ms=max(used_ms,?2),uncertain=EXISTS(SELECT 1 FROM execution_identities WHERE run=?1 AND state='uncertain') WHERE run=?1",params![run,baseline.saturating_add(receipt.elapsed_ms.min(i64::MAX as u64) as i64)]).map_err(error)?;
+        let state = if receipt.result.is_ok() {
+            "finished"
+        } else {
+            "failed"
+        };
+        let result = receipt.result.unwrap_or_else(|e| e);
+        tx.execute(
+            "UPDATE fake_runs SET state=?2,result=?3 WHERE id=?1 AND session=?4",
+            params![run, state, result, token],
+        )
+        .map_err(error)?;
+        if repo.is_some() {
+            tx.execute(
+                "DELETE FROM repo_claims.execution_reservations WHERE token=?1",
+                [&token],
+            )
+            .map_err(error)?;
+        }
+        event(
+            &tx,
+            &run,
+            json!({"kind":state,"result":result,"execution":token}),
+        )?;
+        tx.commit().map_err(error)?;
+    }
+    Ok(())
+}
+fn finish_unlaunched(
+    conn: &mut Connection,
+    run: &str,
+    token: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let repo: Option<String> = conn
+        .query_row(
+            "SELECT repository FROM execution_controls WHERE run=?1",
+            [run],
+            |r| r.get(0),
+        )
+        .map_err(error)?;
+    if let Some(repo) = &repo {
+        crate::git::GitService::open(Path::new(repo))?.attach(conn)?;
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(error)?;
+    crate::execution::transition_at(&tx, token, "finished", crate::execution::now())?;
+    if repo.is_some() {
+        tx.execute(
+            "DELETE FROM repo_claims.execution_reservations WHERE token=?1",
+            [token],
+        )
+        .map_err(error)?;
+    }
+    tx.execute(
+        "UPDATE fake_runs SET state='failed',result=?2 WHERE id=?1 AND session=?3",
+        params![run, reason, token],
+    )
+    .map_err(error)?;
+    event(
+        &tx,
+        run,
+        json!({"kind":"not_launched","execution":token,"reason":reason}),
+    )?;
+    tx.commit().map_err(error)
+}
+struct Dispatch {
     exe: PathBuf,
     run: String,
     bytes: Vec<u8>,
     cwd: Option<PathBuf>,
-    allowance: u64,
-    used: u64,
-) {
+    token: String,
+}
+fn dispatch(db: Arc<Mutex<Connection>>, attempt: Dispatch) {
+    let Dispatch {
+        exe,
+        run,
+        bytes,
+        cwd,
+        token,
+    } = attempt;
     thread::spawn(move || {
-        let start = Instant::now();
-        let session = db
-            .lock()
-            .ok()
-            .and_then(|conn| {
-                conn.query_row("SELECT session FROM fake_runs WHERE id=?1", [&run], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            })
-            .unwrap_or_else(|| run.clone());
-        let execution = crate::process::launch_guard(
-            &exe,
-            &session,
-            cwd.as_deref(),
-            allowance.saturating_sub(used),
-            &bytes,
-        )
-        .and_then(|mut child| {
+        let mut spawned = false;
+        let mut launch = || -> Result<(), String> {
+            let (session, path, remaining) = {
+                let mut conn = db.lock().map_err(error)?;
+                let session = token.clone();
+                let path: String = conn
+                    .query_row(
+                        "SELECT receipt_path FROM execution_identities WHERE token=?1",
+                        [&session],
+                        |r| r.get(0),
+                    )
+                    .map_err(error)?;
+                let tx = conn.transaction().map_err(error)?;
+                crate::execution::transition_at(&tx, &session, "active", crate::execution::now())?;
+                let remaining: i64 = tx
+                    .query_row(
+                        "SELECT max(0,allowance_ms-used_ms) FROM execution_controls WHERE run=?1",
+                        [&run],
+                        |r| r.get(0),
+                    )
+                    .map_err(error)?;
+                tx.commit().map_err(error)?;
+                (session, path, remaining as u64)
+            };
+            let child = crate::process::launch_guard(
+                &exe,
+                &session,
+                cwd.as_deref(),
+                remaining,
+                &bytes,
+                Some(Path::new(&path)),
+            )?;
+            spawned = true;
             let receipt = || -> Result<(), String> {
                 let mut conn = db.lock().map_err(error)?;
                 let tx = conn.transaction().map_err(error)?;
@@ -342,64 +542,56 @@ fn dispatch(
                 tx.commit().map_err(error)
             };
             if let Err(e) = receipt() {
-                let _ = child.kill();
-                let _ = crate::process::finish(child);
+                let _ = crate::process::finish_guard(child, &[], Duration::from_secs(2), || {
+                    Path::new(&path).with_extension("ready").exists()
+                });
                 return Err(e);
             }
-            crate::process::finish_guard(
+            let result = crate::process::finish_guard(
                 child,
                 &bytes,
-                Duration::from_millis(allowance.saturating_sub(used)),
+                Duration::from_millis(remaining).saturating_add(Duration::from_secs(2)),
                 || {
+                    if !Path::new(&path).with_extension("ready").exists() {
+                        return false;
+                    }
                     db.lock()
                         .ok()
-                        .and_then(|conn| {
-                            crate::execution::checkpoint(
-                                &conn,
-                                &run,
-                                used.saturating_add(start.elapsed().as_millis() as u64),
-                            )
-                            .ok()
+                        .and_then(|mut conn| {
+                            let tx = conn.transaction().ok()?;
+                            let stop = crate::execution::checkpoint(&tx, &run, 0).ok()?;
+                            tx.commit().ok()?;
+                            Some(stop)
                         })
                         .unwrap_or(true)
                 },
-            )
-        });
-        if let Ok(conn) = db.lock() {
-            let _ = crate::execution::checkpoint(
-                &conn,
-                &run,
-                used.saturating_add(start.elapsed().as_millis() as u64),
             );
-        }
-        let uncertain = execution
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.contains("guardian shutdown unconfirmed"));
-        let state = if uncertain {
-            "running"
-        } else if execution.is_ok() {
-            "finished"
-        } else {
-            "failed"
-        };
-        let result = execution.unwrap_or_else(|e| e);
-        let persist = || -> Result<(), String> {
             let mut conn = db.lock().map_err(error)?;
-            let tx = conn.transaction().map_err(error)?;
-            if uncertain {
-                tx.execute("UPDATE execution_controls SET uncertain=1,stop=1,used_ms=max(used_ms,allowance_ms) WHERE run=?1",[&run]).map_err(error)?;
-            }
-            tx.execute(
-                "UPDATE fake_runs SET state=?2,result=?3 WHERE id=?1",
-                params![run, state, result],
-            )
-            .map_err(error)?;
-            event(&tx, &run, json!({"kind":state,"result":result}))?;
-            tx.commit().map_err(error)
+            reconcile(&mut conn)?;
+            result.map(|_| ())
         };
-        if let Err(e) = persist() {
-            eprintln!("persist run {run}: {e}");
+        if let Err(e) = launch() {
+            eprintln!("execution {run}: {e}");
+            if !spawned && let Ok(mut conn) = db.lock() {
+                let _ = finish_unlaunched(&mut conn, &run, &token, &e);
+            }
+        }
+        // Any path without authoritative completion remains reserved/uncertain.
+        if let Ok(mut conn) = db.lock() {
+            let _ = reconcile(&mut conn);
+            if let Ok(tx) = conn.transaction() {
+                let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_identities WHERE token=?1 AND state!='finished')",[&token],|r|r.get(0)).unwrap_or(true);
+                if pending {
+                    let _ = crate::execution::transition_at(
+                        &tx,
+                        &token,
+                        "uncertain",
+                        crate::execution::now(),
+                    );
+                    let _=tx.execute("UPDATE execution_controls SET uncertain=1,stop=1,used_ms=max(used_ms,allowance_ms) WHERE run=?1",[&run]);
+                }
+                let _ = tx.commit();
+            }
         }
     });
 }
@@ -517,7 +709,15 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     }
     let listener = UnixListener::bind(&socket).map_err(error)?;
     let db = Arc::new(Mutex::new(open(dir)?));
-    crate::execution::recover(&*db.lock().map_err(error)?)?;
+    fs::create_dir_all(dir.join("receipts")).map_err(error)?;
+    {
+        let mut conn = db.lock().map_err(error)?;
+        crate::execution::recover_clock(&conn, crate::execution::now())?;
+        reconcile(&mut conn)?;
+        crate::execution::recover(&conn)?;
+        recover_reservations(&mut conn)?;
+        reconcile_handbacks(&conn)?;
+    }
     let exe = std::env::current_exe()
         .map_err(error)?
         .with_file_name("fake-agent");

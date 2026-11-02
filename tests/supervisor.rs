@@ -428,7 +428,7 @@ fn schema_two_upgrades_without_inventing_old_snapshots() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),
-        4
+        agentpm::store::SCHEMA_VERSION
     );
 }
 
@@ -810,35 +810,470 @@ fn blocked_input_and_escaped_pipe_holders_cannot_extend_deadline() {
         .is_err()
     );
     assert!(start.elapsed() < Duration::from_secs(2));
-    let mut command = Process::new("/bin/sh");
-    command
-        .args([
-            "-c",
-            "echo '{\"protocol_version\":1,\"action\":{\"kind\":\"success\"}}'",
-        ])
+    let pidfile = dir.path().join("escaped.pid");
+    let start = Instant::now();
+    let child = Process::new(env!("CARGO_BIN_EXE_fake-agent"))
+        .arg("--fixture-escaped-pipes")
+        .arg(&pidfile)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0);
-    unsafe {
-        command.pre_exec(|| {
-            let pid = libc::fork();
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if pid == 0 {
-                libc::setsid();
-                libc::sleep(2);
-                libc::_exit(0);
-            }
-            Ok(())
-        });
-    }
-    let child = command.spawn().unwrap();
-    let start = Instant::now();
+        .process_group(0)
+        .spawn()
+        .unwrap();
     assert!(
-        agentpm::process::finish_with_timeout(child, Duration::from_millis(100))
+        agentpm::process::finish_with_timeout(child, Duration::from_millis(500))
             .unwrap()
             .starts_with("succeeded")
     );
     assert!(start.elapsed() < Duration::from_secs(1));
+    let escaped: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(escaped, 0) },
+        0,
+        "fixture must still hold the pipes after owner completion"
+    );
+}
+
+fn restart(s: &mut Service) {
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    s.child = Process::new(env!("CARGO_BIN_EXE_agentpm"))
+        .arg("--data-dir")
+        .arg(s.dir.path())
+        .args(["supervisor", "serve"])
+        .spawn()
+        .unwrap();
+    wait(|| s.call("status", Command::Status {}).ok());
+}
+fn repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git_cmd(dir.path(), &["init"]);
+    git_cmd(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Keith",
+            "-c",
+            "user.email=keith@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+    );
+    dir
+}
+fn git_cmd(repo: &Path, args: &[&str]) {
+    let result = Process::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+fn bound(s: &Service, repo: &Path, run: &str, text: &str, ms: u64) -> Command {
+    Command::StartControlled {
+        script: s.script(&format!("{run}.json"), text),
+        project: "p".into(),
+        allowance_ms: ms,
+        repository: Some(repo.to_str().unwrap().into()),
+        milestone: Some("m".into()),
+    }
+}
+fn cli_cleanup(repo: &Path, run: &str) -> std::process::Output {
+    Process::new(env!("CARGO_BIN_EXE_agentpm"))
+        .args(["worktree", "--repo"])
+        .arg(repo)
+        .args(["cleanup", run, "m"])
+        .output()
+        .unwrap()
+}
+#[test]
+fn unexpected_revisions_block_start_repair_and_resume_without_spending_attempts() {
+    let s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    let a = git
+        .allocate("revisions", "m", "test-revisions", "HEAD")
+        .unwrap();
+    let command = bound(
+        &s,
+        repo.path(),
+        "revisions",
+        r#"[{"kind":"failure","reason":"repair"}]"#,
+        10000,
+    );
+    git_cmd(
+        &a.path,
+        &[
+            "-c",
+            "user.name=Keith",
+            "-c",
+            "user.email=keith@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "unexpected",
+        ],
+    );
+    assert!(
+        s.call("revisions", command)
+            .unwrap_err()
+            .contains("revision reconciliation")
+    );
+    git_cmd(
+        &a.path,
+        &["update-ref", "refs/heads/test-revisions", &a.expected_head],
+    );
+    s.call(
+        "revisions",
+        bound(
+            &s,
+            repo.path(),
+            "revisions",
+            r#"[{"kind":"failure","reason":"repair"}]"#,
+            10000,
+        ),
+    )
+    .unwrap();
+    terminal(&s, "revisions");
+    git_cmd(
+        &a.path,
+        &[
+            "-c",
+            "user.name=Keith",
+            "-c",
+            "user.email=keith@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "human",
+        ],
+    );
+    assert!(
+        s.call(
+            "repair-rev",
+            Command::Repair {
+                run: "revisions".into()
+            }
+        )
+        .unwrap_err()
+        .contains("revision reconciliation")
+    );
+    assert!(
+        s.call(
+            "resume-rev",
+            Command::Resume {
+                run: "revisions".into()
+            }
+        )
+        .unwrap_err()
+        .contains("revision reconciliation")
+    );
+    assert_eq!(
+        s.call(
+            "c",
+            Command::Controls {
+                run: "revisions".into()
+            }
+        )
+        .unwrap()["repairs"],
+        0
+    );
+}
+#[test]
+fn canonical_reservation_blocks_independent_maintenance_through_uncertain_shutdown() {
+    let s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    git.allocate("reserved", "m", "test-reserved", "HEAD")
+        .unwrap();
+    s.call(
+        "reserved",
+        bound(
+            &s,
+            repo.path(),
+            "reserved",
+            r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
+            20000,
+        ),
+    )
+    .unwrap();
+    assert!(!cli_cleanup(repo.path(), "reserved").status.success());
+    assert!(
+        git.allocate("reserved", "m", "test-reserved", "HEAD")
+            .unwrap_err()
+            .contains("reservation")
+    );
+    let live = wait(|| {
+        let v = s
+            .call(
+                "s",
+                Command::Show {
+                    run: "reserved".into(),
+                },
+            )
+            .unwrap();
+        (v["state"] == "running").then_some(v)
+    });
+    let pid = live["pid"].as_i64().unwrap() as i32;
+    let ready = s
+        .dir
+        .path()
+        .join("receipts")
+        .join(format!("{}.ready", live["session"].as_str().unwrap()));
+    wait(|| ready.exists().then_some(()));
+    // This live guardian's unreaped leader remains held by the running service.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    s.call(
+        "cancel-res",
+        Command::Cancel {
+            run: "reserved".into(),
+        },
+    )
+    .unwrap();
+    wait(|| {
+        let c = s
+            .call(
+                "c",
+                Command::Controls {
+                    run: "reserved".into(),
+                },
+            )
+            .unwrap();
+        (c["identity_unknown"] == true).then_some(c)
+    });
+    assert!(!cli_cleanup(repo.path(), "reserved").status.success());
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    terminal(&s, "reserved");
+    assert!(cli_cleanup(repo.path(), "reserved").status.success());
+}
+#[test]
+fn handback_abort_preserves_first_inspection_freeze_and_reconciles_both_commit_boundaries() {
+    let mut s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    let a = git.allocate("saga", "m", "test-saga", "HEAD").unwrap();
+    s.call(
+        "saga",
+        bound(&s, repo.path(), "saga", r#"[{"kind":"success"}]"#, 10000),
+    )
+    .unwrap();
+    terminal(&s, "saga");
+    s.call("take-saga", Command::Takeover { run: "saga".into() })
+        .unwrap();
+    std::fs::write(a.path.join("first"), "one").unwrap();
+    let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER abort_handback BEFORE UPDATE OF human ON execution_controls WHEN NEW.human=0 BEGIN SELECT RAISE(ABORT,'injected human=0 abort'); END;").unwrap();
+    assert!(
+        s.call("back-saga", Command::Handback { run: "saga".into() })
+            .unwrap_err()
+            .contains("injected")
+    );
+    assert!(!cli_cleanup(repo.path(), "saga").status.success());
+    assert_eq!(
+        s.call("c", Command::Controls { run: "saga".into() })
+            .unwrap()["human_owned"],
+        true
+    );
+    std::fs::write(a.path.join("second"), "two").unwrap();
+    db.execute_batch("DROP TRIGGER abort_handback").unwrap();
+    restart(&mut s);
+    let report = s
+        .call("back-saga", Command::Handback { run: "saga".into() })
+        .unwrap();
+    assert!(report["edits"].as_str().unwrap().contains("first"));
+    assert!(!report["edits"].as_str().unwrap().contains("second"));
+    assert_eq!(
+        report,
+        s.call("back-saga", Command::Handback { run: "saga".into() })
+            .unwrap()
+    );
+    s.call("take-again", Command::Takeover { run: "saga".into() })
+        .unwrap();
+    let claims =
+        rusqlite::Connection::open(repo.path().join(".git/agentpm-claims.sqlite3")).unwrap();
+    claims.execute_batch("CREATE TRIGGER abort_unfreeze BEFORE DELETE ON human_ownership BEGIN SELECT RAISE(ABORT,'injected unfreeze abort'); END").unwrap();
+    assert!(
+        s.call("back-final", Command::Handback { run: "saga".into() })
+            .is_err()
+    );
+    assert!(
+        !db.query_row(
+            "SELECT human FROM execution_controls WHERE run='saga'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        claims
+            .query_row("SELECT count(*) FROM human_ownership", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        1
+    );
+    claims.execute_batch("DROP TRIGGER abort_unfreeze").unwrap();
+    restart(&mut s);
+    assert_eq!(
+        claims
+            .query_row("SELECT count(*) FROM human_ownership", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        s.call("back-final", Command::Handback { run: "saga".into() })
+            .unwrap()["evidence_valid"],
+        false
+    );
+}
+#[test]
+fn launch_intent_failure_rolls_back_canonical_reservation_and_supervisor_state() {
+    let s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    git.allocate("rollback", "m", "test-rollback", "HEAD")
+        .unwrap();
+    let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER abort_intent BEFORE INSERT ON supervisor_requests WHEN NEW.id='rollback' BEGIN SELECT RAISE(ABORT,'injected intent abort'); END").unwrap();
+    assert!(
+        s.call(
+            "rollback",
+            bound(
+                &s,
+                repo.path(),
+                "rollback",
+                r#"[{"kind":"success"}]"#,
+                10000
+            )
+        )
+        .is_err()
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM fake_runs WHERE id='rollback'",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(cli_cleanup(repo.path(), "rollback").status.success());
+}
+#[test]
+fn guardian_completion_releases_recovered_slots_and_repository_reservation_without_pid_inference() {
+    let mut s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    git.allocate("recover-owned", "m", "test-recover", "HEAD")
+        .unwrap();
+    s.call(
+        "one-slot",
+        Command::Policy {
+            slots: 1,
+            project_cap: 1,
+        },
+    )
+    .unwrap();
+    s.call(
+        "recover-owned",
+        bound(
+            &s,
+            repo.path(),
+            "recover-owned",
+            r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
+            1000,
+        ),
+    )
+    .unwrap();
+    wait(|| {
+        let v = s
+            .call(
+                "s",
+                Command::Show {
+                    run: "recover-owned".into(),
+                },
+            )
+            .unwrap();
+        (v["state"] == "running").then_some(v)
+    });
+    restart(&mut s);
+    // No timer/PID-based release: only the nonce/hash-bound guardian receipt counts.
+    let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+    db.execute(
+        "UPDATE fake_runs SET pid=?1 WHERE id='recover-owned'",
+        [std::process::id()],
+    )
+    .unwrap();
+    terminal(&s, "recover-owned");
+    assert_eq!(
+        s.call(
+            "reconcile",
+            Command::Reconcile {
+                run: "recover-owned".into()
+            }
+        )
+        .unwrap()["identity_unknown"],
+        false
+    );
+    assert!(cli_cleanup(repo.path(), "recover-owned").status.success());
+    s.call(
+        "new-after-recovery",
+        Command::Start {
+            script: s.script("after.json", r#"[{"kind":"success"}]"#),
+        },
+    )
+    .unwrap();
+    terminal(&s, "new-after-recovery");
+}
+
+#[test]
+fn unknown_historical_execution_keeps_capacity_and_canonical_freeze_without_pid_kills() {
+    let mut s = Service::new();
+    let repo = repo();
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    git.allocate("historical", "m", "test-historical", "HEAD")
+        .unwrap();
+    s.call(
+        "one-historical",
+        Command::Policy {
+            slots: 1,
+            project_cap: 1,
+        },
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+    db.execute("INSERT INTO fake_runs(id,state,operation,pid,session,cwd,executable,created_at) VALUES('historical','running','historical',?1,'legacy-session','/','/missing','unknown')",[std::process::id()]).unwrap();
+    db.execute("INSERT INTO execution_controls(run,project,allowance_ms,used_ms,repository,milestone) VALUES('historical','p',500,750,?1,'m')",[repo.path().to_str().unwrap()]).unwrap();
+    restart(&mut s);
+    for id in ["history-one", "history-two"] {
+        let c = s
+            .call(
+                id,
+                Command::Reconcile {
+                    run: "historical".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(c["used_ms"], 750);
+        assert_eq!(c["identity_unknown"], true);
+    }
+    assert!(!cli_cleanup(repo.path(), "historical").status.success());
+    assert!(
+        s.call(
+            "blocked-history",
+            Command::Start {
+                script: s.script("history-next.json", r#"[{"kind":"success"}]"#)
+            }
+        )
+        .is_err()
+    );
+    // The deliberately unrelated stored PID is this still-running test process.
+    assert_eq!(unsafe { libc::kill(std::process::id() as i32, 0) }, 0);
 }
