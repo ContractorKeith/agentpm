@@ -3,15 +3,15 @@
 - Repository: https://github.com/ContractorKeith/agentpm
 - Basecamp card: https://app.basecamp.com/6307587/buckets/49448999/card_tables/cards/10466615798
 - T3 project: mcp:1b693dce-06fe-4e58-b089-40e426fbb168
-- Status: M0 merged in PR #15 at 429e133. M1/M2/M3 next in parallel, merged in that order. No production runtime or release yet.
+- Status: M0–M3 merged (PRs #15/#19/#17/#18); current foundation includes supervisor fake execution, context snapshots and owned Git worktrees. Next M4 execution controls, then adapters. No production runtime or release yet.
 - Build authority: Sol 6.1 workers in new T3 worktree threads; primary orchestrator reviews, integrates, and maintains tracking. No nested worker delegation.
 
 ## Milestones
 
 - M0: [Contracts, fake harness, schema, and CI](https://github.com/ContractorKeith/agentpm/issues/1) — merged PR #15; Basecamp step 10466617013 completed.
-- M1: [Durable supervisor and reconnectable fake runs](https://github.com/ContractorKeith/agentpm/issues/2) — open; Basecamp step 10466617061.
-- M2: [Versioned context packages and existing skills](https://github.com/ContractorKeith/agentpm/issues/3) — open; Basecamp step 10466617128.
-- M3: [Owned milestone worktrees and branches](https://github.com/ContractorKeith/agentpm/issues/4) — open; Basecamp step 10466617182.
+- M1: [Durable supervisor and reconnectable fake runs](https://github.com/ContractorKeith/agentpm/issues/2) — merged PR #19; Basecamp step 10466617061 completed.
+- M2: [Versioned context packages and existing skills](https://github.com/ContractorKeith/agentpm/issues/3) — merged PR #17; Basecamp step 10466617128 completed.
+- M3: [Owned milestone worktrees and branches](https://github.com/ContractorKeith/agentpm/issues/4) — merged PR #18; Basecamp step 10466617182 completed.
 - M4: [Budgeted execution, crash recovery, and human takeover](https://github.com/ContractorKeith/agentpm/issues/5) — open; Basecamp step 10466617235.
 - M5: [Claude Code adapter](https://github.com/ContractorKeith/agentpm/issues/6) — open; Basecamp step 10466617286.
 - M6: [Codex adapter](https://github.com/ContractorKeith/agentpm/issues/7) — open; Basecamp step 10466617393.

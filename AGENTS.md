@@ -3,7 +3,7 @@
 A Rust autonomous project manager for approved specs: local Claude Code, Codex, and OpenCode workers produce independently reviewed GitHub PRs. Users own product merges. v1 acceptance is the full workflow in docs/PLAN.md on macOS and Linux.
 
 ## Status
-M0 foundation, 2026-11-02: Rust contracts, SQLite migration, and deterministic fake-process demo exist. No daemon, real backend adapters, or project execution runtime yet.
+M0–M3 merged, 2026-11-02: contracts, durable fake-run supervisor, immutable context and owned Git worktrees exist. M4 execution controls are next; real backend adapters and autonomous project scheduling remain unimplemented.
 
 ## Commands
 Required gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace --release`.
