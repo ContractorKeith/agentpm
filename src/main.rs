@@ -16,6 +16,11 @@ struct Cli {
 enum Commands {
     /// Validate a deterministic script through an external fake-agent process.
     Fake { script: String },
+    /// Create, retrieve or explicitly update immutable context snapshots.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
     Supervisor {
         #[command(subcommand)]
         command: SupervisorCommand,
@@ -47,6 +52,21 @@ enum RunCommand {
         run: String,
     },
 }
+#[derive(Subcommand)]
+enum ContextCommand {
+    Create {
+        manifest: std::path::PathBuf,
+    },
+    Show {
+        revision: String,
+    },
+    Update {
+        revision: String,
+        #[arg(long)]
+        acknowledge: String,
+        manifest: std::path::PathBuf,
+    },
+}
 fn run() -> Result<bool, String> {
     use agentpm::supervisor::{self, Command as ServiceCommand, Request as ServiceRequest};
     let cli = Cli::parse();
@@ -57,6 +77,27 @@ fn run() -> Result<bool, String> {
     };
     let script = match cli.command {
         Commands::Fake { script } => script,
+        Commands::Context { command } => {
+            use agentpm::context::{ContextStore, read_manifest};
+            let store = ContextStore::new(dir.join("context"));
+            let value = match command {
+                ContextCommand::Create { manifest } => {
+                    serde_json::json!({"version": 1, "revision": store.create(read_manifest(&manifest)?)?})
+                }
+                ContextCommand::Show { revision } => {
+                    serde_json::json!({"version": 1, "revision": revision, "package": store.show(&revision)?})
+                }
+                ContextCommand::Update {
+                    revision,
+                    acknowledge,
+                    manifest,
+                } => {
+                    serde_json::json!({"version": 1, "revision": store.update(&revision, &acknowledge, read_manifest(&manifest)?)?})
+                }
+            };
+            println!("{value}");
+            return Ok(false);
+        }
         command => {
             let (id, command) = match command {
                 Commands::Supervisor {
@@ -126,7 +167,7 @@ fn run() -> Result<bool, String> {
                     command: RunCommand::Show { run },
                 } => ("show".into(), ServiceCommand::Show { run }),
                 Commands::Events { cursor } => ("events".into(), ServiceCommand::Events { cursor }),
-                Commands::Fake { .. } => unreachable!(),
+                Commands::Fake { .. } | Commands::Context { .. } => unreachable!(),
             };
             println!(
                 "{}",
