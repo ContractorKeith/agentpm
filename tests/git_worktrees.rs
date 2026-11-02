@@ -28,6 +28,93 @@ fn repo() -> TempDir {
     git(t.path(), &["commit", "-m", "initial"]);
     t
 }
+
+#[test]
+fn cleanup_preserves_edits_hidden_by_index_flags() {
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let t = repo();
+        let service = GitService::open(t.path()).unwrap();
+        let a = service.allocate("r", "m", "hidden-edit", "HEAD").unwrap();
+        git(&a.path, &["update-index", flag, "tracked"]);
+        std::fs::write(a.path.join("tracked"), "human edit").unwrap();
+        assert!(git(&a.path, &["status", "--porcelain"]).is_empty());
+        assert!(service.cleanup("r", "m").is_err());
+        assert_eq!(
+            std::fs::read_to_string(a.path.join("tracked")).unwrap(),
+            "human edit"
+        );
+        assert_eq!(
+            git(t.path(), &["rev-parse", "hidden-edit"]),
+            a.expected_head
+        );
+    }
+}
+
+#[test]
+fn inherited_git_environment_cannot_redirect_operations() {
+    let a = repo();
+    let b = repo();
+    let b_before = git(b.path(), &["show-ref"]);
+    let index = b.path().join(".git/index");
+    let index_before = std::fs::read(&index).unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agentpm"))
+            .env("GIT_DIR", b.path().join(".git"))
+            .env("GIT_WORK_TREE", b.path())
+            .env("GIT_COMMON_DIR", b.path().join(".git"))
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", b.path())
+            .args(["worktree", "--repo"])
+            .arg(a.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let allocated = invoke(&["allocate", "r", "m", "right-repo"]);
+    assert!(
+        allocated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allocated.stderr)
+    );
+    assert!(a.path().join(".git/agentpm-claims.sqlite3").exists());
+    assert!(!b.path().join(".git/agentpm-claims.sqlite3").exists());
+    assert_eq!(git(b.path(), &["show-ref"]), b_before);
+    assert_eq!(std::fs::read(&index).unwrap(), index_before);
+    assert!(invoke(&["cleanup", "r", "m"]).status.success());
+    assert_eq!(git(b.path(), &["show-ref"]), b_before);
+}
+
+#[test]
+fn allocation_recovery_rejects_a_moved_branch() {
+    let t = repo();
+    let service = GitService::open(t.path()).unwrap();
+    let a = service.allocate("r", "m", "moved", "HEAD").unwrap();
+    git(t.path(), &["worktree", "remove", a.path.to_str().unwrap()]);
+    let db = rusqlite::Connection::open(t.path().join(".git/agentpm-claims.sqlite3")).unwrap();
+    db.execute("UPDATE allocations SET state='allocating'", [])
+        .unwrap();
+    git(t.path(), &["commit", "--allow-empty", "-m", "new revision"]);
+    let new_head = git(t.path(), &["rev-parse", "HEAD"]);
+    git(
+        t.path(),
+        &[
+            "update-ref",
+            "refs/heads/moved",
+            &new_head,
+            &a.expected_head,
+        ],
+    );
+    assert!(
+        service
+            .allocate("r", "m", "moved", &a.expected_head)
+            .is_err()
+    );
+    assert!(!a.path.exists());
+    assert_eq!(git(t.path(), &["rev-parse", "moved"]), new_head);
+    assert_eq!(service.inspect("r", "m").unwrap().state, "allocating");
+}
 fn cli(path: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_agentpm"))
         .args(["worktree", "--repo"])

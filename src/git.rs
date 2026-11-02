@@ -10,6 +10,19 @@ use std::{
 
 type Result<T> = std::result::Result<T, String>;
 
+// Hooks and tools can export Git's repository/index/config selectors. Our explicit
+// repository must own every operation, including update-ref's separate launcher.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 #[derive(Debug, Serialize)]
 pub struct Allocation {
     pub protocol_version: u32,
@@ -27,11 +40,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(cwd)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -121,7 +133,7 @@ impl GitService {
     // marker. A crash cannot leave an indistinguishable unowned branch.
     fn refs(&self, script: &str) -> Result<()> {
         use std::io::Write;
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .arg("--git-dir")
             .arg(&self.common)
             .args(["update-ref", "--stdin"])
@@ -179,6 +191,34 @@ impl GitService {
                 .map_err(|e| e.to_string())?
         {
             return Err("worktree registration mismatch".into());
+        }
+        Ok(())
+    }
+    fn unchanged_checkout(&self, a: &Allocation) -> Result<()> {
+        // Status and non-force removal both trust these flags and can miss edits.
+        let entries = git(&a.path, ["ls-files", "-v", "-z"])?;
+        if entries
+            .split('\0')
+            .filter_map(|entry| entry.bytes().next())
+            .any(|tag| tag.is_ascii_lowercase() || tag == b'S')
+        {
+            return Err(
+                "worktree has assume-unchanged or skip-worktree entries; preserving it".into(),
+            );
+        }
+        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+            || !git(
+                &a.path,
+                [
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored",
+                ],
+            )?
+            .is_empty()
+        {
+            return Err("worktree has changes or unexpected commits; preserving it".into());
         }
         Ok(())
     }
@@ -245,6 +285,9 @@ impl GitService {
             ))?;
         }
         self.owned(&a)?;
+        if self.head(&format!("refs/heads/{}", a.branch)).as_deref() != Some(&a.expected_head) {
+            return Err("allocation branch moved; preserving it for reconciliation".into());
+        }
         if !a.path.exists() {
             if a.state != "allocating" {
                 return Err("owned checkout disappeared; manual reconciliation required".into());
@@ -262,6 +305,11 @@ impl GitService {
             )?;
         }
         self.checkout_matches(&a)?;
+        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+            || self.head(&format!("refs/heads/{}", a.branch)).as_deref() != Some(&a.expected_head)
+        {
+            return Err("allocation revision changed; preserving it for reconciliation".into());
+        }
         db.execute(
             "UPDATE allocations SET state='allocated' WHERE run=?1 AND milestone=?2",
             params![run, milestone],
@@ -303,20 +351,7 @@ impl GitService {
         self.owned(&a)?;
         if a.path.exists() {
             self.checkout_matches(&a)?;
-            if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
-                || !git(
-                    &a.path,
-                    [
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                        "--ignored",
-                    ],
-                )?
-                .is_empty()
-            {
-                return Err("worktree has changes or unexpected commits; preserving it".into());
-            }
+            self.unchanged_checkout(&a)?;
         } else if a.state != "cleaning" {
             return Err("worktree missing without cleanup intent".into());
         }
@@ -333,20 +368,7 @@ impl GitService {
         if a.path.exists() {
             self.owned(&a)?;
             self.checkout_matches(&a)?;
-            if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
-                || !git(
-                    &a.path,
-                    [
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                        "--ignored",
-                    ],
-                )?
-                .is_empty()
-            {
-                return Err("worktree changed during cleanup; preserving it".into());
-            }
+            self.unchanged_checkout(&a)?;
             git(
                 &self.common,
                 [

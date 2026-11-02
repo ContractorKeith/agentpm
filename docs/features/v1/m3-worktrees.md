@@ -5,7 +5,8 @@ service seam; `agentpm worktree --repo PATH` exposes it through the single binar
 M8 supplies scheduling. No supervisor, context, domain state or M0 schema changes
 are included. No dependency was added.
 
-Repository identity is the canonical Git common directory. A repository-local
+Repository identity is the canonical Git common directory. Every Git subprocess
+clears inherited GIT_* selectors/configuration before using the explicit repository. A repository-local
 `agentpm-claims.sqlite3` keeps unique run/milestone, branch and generated path
 claims across processes and restarts. SQLite immediate transactions serialize
 cooperating callers. Allocation persists intent before Git effects. A Git ref
@@ -13,12 +14,14 @@ transaction atomically creates an absent branch plus its private ownership ref
 under `refs/agentpm/owners/RUN/MILESTONE`, both pointing to the pinned base commit.
 A retry checks recorded request parameters and reconciles missing checkout
 creation without adopting a preexisting unowned branch. Changed base arguments
-are conflicts. Completed claims remain tombstones; identifiers cannot be reused.
+are conflicts. Allocation success requires the branch tip and checkout HEAD to
+match the recorded expected revision; moved revisions require reconciliation. Completed claims remain tombstones; identifiers cannot be reused.
 The private refs and database must be retained together and are not host refs.
 
 Cleanup requires the ownership ref, registered linked-worktree identity and
 backlink, expected symbolic branch and expected HEAD, unchanged branch ref,
-and no tracked, untracked or ignored files. The primary checkout is excluded.
+and no tracked, untracked or ignored changes. Index entries marked assume-unchanged
+or skip-worktree block cleanup because Git status can conceal their edits. The primary checkout is excluded.
 It persists cleanup intent, invokes Git worktree removal without force, then
 atomically deletes branch plus ownership ref using expected old SHAs. A retry
 can finish after checkout removal or ref deletion. Unexpected states preserve
