@@ -201,3 +201,69 @@ fn immutable_context_command_round_trip_and_guards() {
     fs::write(data.join("context").join(format!("{id}.json")), "{}").unwrap();
     assert!(!cli(&data, &["show", id]).status.success());
 }
+
+#[cfg(unix)]
+#[test]
+fn context_first_private_directory_supports_supervisor() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let data = root.join("fresh/data");
+    let manifest = root.join("manifest.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&minimal_manifest(&root)).unwrap(),
+    )
+    .unwrap();
+    let mut create = Command::new(env!("CARGO_BIN_EXE_agentpm"));
+    create
+        .args(["context", "--data-dir"])
+        .arg(&data)
+        .arg("create")
+        .arg(&manifest);
+    unsafe {
+        create.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    let revision = success(create.output().unwrap())["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentpm"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["supervisor", "serve"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        if agentpm::supervisor::client(
+            &data,
+            agentpm::supervisor::Request {
+                version: 1,
+                id: "status".into(),
+                command: agentpm::supervisor::Command::Status {},
+            },
+        )
+        .is_ok()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let retrieved = cli(&data, &["show", &revision]);
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert!(ready, "supervisor must accept context-created directory");
+    success(retrieved);
+}

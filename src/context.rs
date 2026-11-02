@@ -277,7 +277,14 @@ impl ContextStore {
             return Err("serialized context package exceeds byte limit".into());
         }
         let id = identity(&bytes);
-        fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
+        let mut directories = fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directories.mode(0o700);
+        }
+        directories.create(&self.root).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
