@@ -2,4 +2,8 @@
 pub mod contracts;
 pub mod git;
 pub mod harness;
+pub mod process;
 pub mod store;
+
+pub mod context;
+pub mod supervisor;

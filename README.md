@@ -52,3 +52,56 @@ only removes unchanged, clean owned allocations; committed worker output needs
 later explicit revision reconciliation before it can qualify for cleanup.
 Inspect returns the durable record (including interrupted-operation state), not
 an assertion that the checkout still matches it. See [M3 contracts](docs/features/v1/m3-worktrees.md).
+Context snapshots are available through the same binary:
+
+```sh
+agentpm context --data-dir /absolute/private/data create /absolute/manifest.json
+agentpm context --data-dir /absolute/private/data show REVISION
+agentpm context --data-dir /absolute/private/data update REVISION --acknowledge REVISION /absolute/manifest.json
+```
+
+The manifest is versioned JSON. All paths must be absolute; roots explicitly
+allow collection. For example (replace paths with existing files):
+
+```json
+{
+  "version": 1,
+  "roots": ["/repo", "/user/skills"],
+  "approved": {"path": "/repo/spec.md", "source_revision": "approval-42"},
+  "brief": {"path": "/repo/brief.md", "source_revision": "brief-1"},
+  "instructions": [{"path": "/repo/AGENTS.md", "source_revision": "commit-sha"}],
+  "dependencies": [],
+  "roles": {
+    "implementer": {
+      "backend": "codex", "model": "gpt-6.1-sol",
+      "skills": [{"path": "/user/skills/example/SKILL.md", "source_revision": "skill-1"}]
+    }
+  },
+  "overrides": {}
+}
+```
+
+Overrides replace entire existing roles. Skill references are not followed;
+list each required file explicitly. Missing inputs, credential paths, scope
+violations and collection limits fail with exit 2 and no stdout. Create/update
+return versioned JSON with a revision; show returns its embedded contents.
+See [M2 contracts](docs/features/v1/m2-context.md) for provenance and limits.
+M1 adds a detached local service for fake runs (no real adapters or project
+scheduler). Build both binaries, then use an absolute script path:
+
+```sh
+agentpm --data-dir "$HOME/.agentpm" supervisor start
+agentpm --data-dir "$HOME/.agentpm" run start "$PWD/harness/success.json" --command-id example-1
+agentpm --data-dir "$HOME/.agentpm" run show example-1
+agentpm --data-dir "$HOME/.agentpm" events --cursor 0
+```
+
+The data directory must have mode 700. `supervisor status` reports service PID;
+`supervisor serve` runs in the foreground for service managers. Reuse the same
+command ID and exact payload to retry a start safely. Events return one bounded
+event per page; use its cursor for the next page, stopping at an empty page.
+Service diagnostics are in `supervisor.log`. Fake delay actions use real time
+inside the service; the original `fake` demo retains its virtual clock.
+See [M1 contracts](docs/features/v1/m1-supervisor.md) for limits and recovery
+boundaries. `libc` supplies Unix advisory locking, private file creation and
+termination of newly owned child process groups on macOS/Linux.
