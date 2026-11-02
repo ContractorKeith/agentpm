@@ -36,6 +36,22 @@ cargo build --workspace --release
 Tests launch the real CLI and fake-agent processes without credentials or paid
 APIs. See [M0 contracts](docs/features/v1/m0-contracts.md) for boundaries.
 
+Owned worktrees (M3, independent of scheduling):
+
+```sh
+agentpm worktree --repo /path/to/repo allocate run-1 milestone-1 agentpm/run-1/milestone-1 --base main
+agentpm worktree --repo /path/to/repo inspect run-1 milestone-1
+agentpm worktree --repo /path/to/repo cleanup run-1 milestone-1
+```
+
+These commands emit one version-1 JSON allocation record; errors exit 2 with
+stderr diagnostics. Use a pinned commit for `--base` when retrying across base
+branch changes. Claims and generated checkout paths live in the canonical Git
+common directory, shared by repository aliases and linked checkouts. Cleanup
+only removes unchanged, clean owned allocations; committed worker output needs
+later explicit revision reconciliation before it can qualify for cleanup.
+Inspect returns the durable record (including interrupted-operation state), not
+an assertion that the checkout still matches it. See [M3 contracts](docs/features/v1/m3-worktrees.md).
 Context snapshots are available through the same binary:
 
 ```sh

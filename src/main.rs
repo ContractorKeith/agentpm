@@ -21,6 +21,13 @@ enum Commands {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Manage repository-local owned milestone worktrees.
+    Worktree {
+        #[arg(long)]
+        repo: std::path::PathBuf,
+        #[command(subcommand)]
+        action: WorktreeCommand,
+    },
     Supervisor {
         #[command(subcommand)]
         command: SupervisorCommand,
@@ -67,6 +74,24 @@ enum ContextCommand {
         manifest: std::path::PathBuf,
     },
 }
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    Allocate {
+        run: String,
+        milestone: String,
+        branch: String,
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+    },
+    Inspect {
+        run: String,
+        milestone: String,
+    },
+    Cleanup {
+        run: String,
+        milestone: String,
+    },
+}
 fn run() -> Result<bool, String> {
     use agentpm::supervisor::{self, Command as ServiceCommand, Request as ServiceRequest};
     let cli = Cli::parse();
@@ -96,6 +121,24 @@ fn run() -> Result<bool, String> {
                 }
             };
             println!("{value}");
+            return Ok(false);
+        }
+        Commands::Worktree { repo, action } => {
+            let service = agentpm::git::GitService::open(&repo)?;
+            let allocation = match action {
+                WorktreeCommand::Allocate {
+                    run,
+                    milestone,
+                    branch,
+                    base,
+                } => service.allocate(&run, &milestone, &branch, &base)?,
+                WorktreeCommand::Inspect { run, milestone } => service.inspect(&run, &milestone)?,
+                WorktreeCommand::Cleanup { run, milestone } => service.cleanup(&run, &milestone)?,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&allocation).map_err(|e| e.to_string())?
+            );
             return Ok(false);
         }
         command => {
@@ -167,7 +210,9 @@ fn run() -> Result<bool, String> {
                     command: RunCommand::Show { run },
                 } => ("show".into(), ServiceCommand::Show { run }),
                 Commands::Events { cursor } => ("events".into(), ServiceCommand::Events { cursor }),
-                Commands::Fake { .. } | Commands::Context { .. } => unreachable!(),
+                Commands::Fake { .. } | Commands::Context { .. } | Commands::Worktree { .. } => {
+                    unreachable!()
+                }
             };
             println!(
                 "{}",
