@@ -1,0 +1,19 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "agentpm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+default-run = "agentpm"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
