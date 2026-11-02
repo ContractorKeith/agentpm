@@ -1,6 +1,6 @@
 //! Initial transactional migration, not a supervisor persistence implementation.
 use rusqlite::{Connection, Result};
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -11,6 +11,12 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if version == 0 {
         tx.execute_batch(include_str!("schema.sql"))?;
+    }
+    if version < 2 {
+        tx.execute_batch(include_str!("supervisor-schema.sql"))?;
+    }
+    if version < 3 {
+        tx.execute_batch("ALTER TABLE fake_runs ADD COLUMN script_bytes BLOB;")?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()
