@@ -2,6 +2,86 @@ use agentpm::{contracts::*, store};
 use rusqlite::Connection;
 use std::process::Command;
 
+#[test]
+fn unit_wire_variants_reject_extra_fields() {
+    for kind in ["success", "malformed"] {
+        let action = format!(r#"{{"kind":"{kind}","extra":true}}"#);
+        assert!(serde_json::from_str::<agentpm::harness::Action>(&action).is_err());
+        let output = exercise(&format!("[{action}]"));
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let message = format!(r#"{{"protocol_version":1,"action":{action}}}"#);
+        assert!(serde_json::from_str::<agentpm::harness::FakeMessage>(&message).is_err());
+    }
+    assert!(serde_json::from_str::<Usage>(r#"{"status":"unknown","tokens":0}"#).is_err());
+    assert!(serde_json::from_str::<Event>(r#"{"kind":"started","extra":true}"#).is_err());
+    assert_eq!(
+        serde_json::to_string(&Usage::Unknown {}).unwrap(),
+        r#"{"status":"unknown"}"#
+    );
+}
+
+#[test]
+fn active_work_can_be_canceled_without_delivery_evidence() {
+    for initial in [
+        MilestoneState::Implementing,
+        MilestoneState::Checking,
+        MilestoneState::Reviewing,
+        MilestoneState::Repairing,
+    ] {
+        let mut state = initial;
+        state
+            .transition(MilestoneState::Canceled, None, &revision())
+            .unwrap();
+        assert_eq!(state, MilestoneState::Canceled);
+        assert!(
+            state
+                .transition(MilestoneState::Ready, Some(&evidence()), &revision())
+                .is_err()
+        );
+        assert_eq!(state, MilestoneState::Canceled);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reported_outcome_must_match_exact_exit_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("fake");
+    let request = Request {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::new("exit-test").unwrap(),
+        command: agentpm::contracts::Command::ExerciseFake {
+            script: "unused".into(),
+        },
+    };
+    for (action, expected) in [
+        (r#"{"kind":"failure","reason":"failed"}"#, 1),
+        (r#"{"kind":"success"}"#, 0),
+        (r#"{"kind":"block","reason":"decision"}"#, 0),
+    ] {
+        for (ending, code) in [
+            ("exit 0", Some(0)),
+            ("exit 1", Some(1)),
+            ("exit 2", Some(2)),
+            ("kill -TERM $$", None),
+        ] {
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"protocol_version\":1,\"action\":{action}}}'\n{ending}\n"
+            );
+            std::fs::write(&executable, script).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = agentpm::harness::execute(&request, &executable);
+            assert_eq!(
+                result.is_ok(),
+                code == Some(expected),
+                "{action}: {ending}: {result:?}"
+            );
+        }
+    }
+}
+
 fn revision() -> RevisionIdentity {
     RevisionIdentity {
         head: "head-a".into(),
@@ -110,7 +190,7 @@ fn wire_contract_roundtrips_and_rejects_unknown_input() {
         sequence: 7,
         logical_milliseconds: 9,
         event: Event::Succeeded {
-            usage: Usage::Unknown,
+            usage: Usage::Unknown {},
         },
     };
     let json = serde_json::to_string(&event).unwrap();
@@ -222,7 +302,7 @@ fn executable_fake_modes_have_validated_external_behavior() {
     assert_eq!(
         events[2].event,
         Event::Succeeded {
-            usage: Usage::Unknown
+            usage: Usage::Unknown {}
         }
     );
     let block = exercise(r#"[{"kind":"block","reason":"decision"}]"#);

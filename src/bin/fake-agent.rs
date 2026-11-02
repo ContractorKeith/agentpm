@@ -13,7 +13,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let actions: Vec<Action> = serde_json::from_slice(&bytes)?;
     let mut out = std::io::stdout().lock();
     for action in actions {
-        if matches!(action, Action::Malformed) {
+        if matches!(action, Action::Malformed {}) {
             writeln!(out, "{{malformed")?;
             return Ok(false);
         }

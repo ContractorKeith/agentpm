@@ -42,7 +42,7 @@ ids!(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Usage {
-    Unknown,
+    Unknown {},
     Reported { tokens: u64, source: String },
     Estimated { tokens: u64, source: String },
 }
@@ -144,10 +144,16 @@ impl MilestoneState {
                 )
                 | (
                     Checking,
-                    Reviewing | Repairing | Failed | StaleBase | HumanOwned
+                    Reviewing | Repairing | Failed | Canceled | StaleBase | HumanOwned
                 )
-                | (Reviewing, Repairing | Failed | StaleBase | HumanOwned)
-                | (Repairing, Checking | Failed | StaleBase | HumanOwned)
+                | (
+                    Reviewing,
+                    Repairing | Failed | Canceled | StaleBase | HumanOwned
+                )
+                | (
+                    Repairing,
+                    Checking | Failed | Canceled | StaleBase | HumanOwned
+                )
                 | (StaleBase, Implementing | Repairing | HumanOwned | Canceled)
                 | (Waiting | Paused, Implementing | Canceled | HumanOwned)
                 | (HumanOwned, StaleBase)
@@ -189,7 +195,7 @@ impl Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
-    Started,
+    Started {},
     Delayed { milliseconds: u64 },
     Blocked { reason: String },
     Succeeded { usage: Usage },

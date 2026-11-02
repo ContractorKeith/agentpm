@@ -12,8 +12,8 @@ pub const MAX_BYTES: u64 = 64 * 1024;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Delay { milliseconds: u64 },
-    Success,
-    Malformed,
+    Success {},
+    Malformed {},
     Block { reason: String },
     Failure { reason: String },
 }
@@ -54,7 +54,7 @@ pub fn execute(request: &Request, fake_agent: &Path) -> Result<Vec<EventEnvelope
         request_id: request.request_id.clone(),
         sequence: 1,
         logical_milliseconds: 0,
-        event: Event::Started,
+        event: Event::Started {},
     }];
     let mut elapsed = 0u64;
     let mut terminal = false;
@@ -75,10 +75,10 @@ pub fn execute(request: &Request, fake_agent: &Path) -> Result<Vec<EventEnvelope
                     .ok_or("logical clock overflow")?;
                 Event::Delayed { milliseconds }
             }
-            Action::Success => {
+            Action::Success {} => {
                 terminal = true;
                 Event::Succeeded {
-                    usage: Usage::Unknown,
+                    usage: Usage::Unknown {},
                 }
             }
             Action::Block { reason } => {
@@ -90,7 +90,7 @@ pub fn execute(request: &Request, fake_agent: &Path) -> Result<Vec<EventEnvelope
                 failed = true;
                 Event::Failed { reason }
             }
-            Action::Malformed => return Err("unexpected malformed action".into()),
+            Action::Malformed {} => return Err("unexpected malformed action".into()),
         };
         events.push(EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -100,7 +100,8 @@ pub fn execute(request: &Request, fake_agent: &Path) -> Result<Vec<EventEnvelope
             event,
         });
     }
-    if !terminal || status.success() == failed {
+    let expected_exit = if failed { 1 } else { 0 };
+    if !terminal || status.code() != Some(expected_exit) {
         return Err("missing terminal event or inconsistent process exit".into());
     }
     Ok(events)
