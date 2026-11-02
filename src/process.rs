@@ -12,8 +12,20 @@ pub fn launch(executable: &Path, script: &str) -> Result<Child, String> {
     launch_session(executable, script, "external-test")
 }
 pub fn launch_session(executable: &Path, script: &str, session: &str) -> Result<Child, String> {
+    launch_in(executable, script, session, None)
+}
+pub fn launch_in(
+    executable: &Path,
+    script: &str,
+    session: &str,
+    cwd: Option<&Path>,
+) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
         .env("AGENTPM_EXECUTION_ID", session)
         .arg(script)
         .arg("--realtime")
@@ -28,36 +40,32 @@ pub fn launch_session(executable: &Path, script: &str, session: &str) -> Result<
         .spawn()
         .map_err(|e| format!("launch {}: {e}", executable.display()))
 }
-pub fn launch_snapshot(executable: &Path, bytes: &[u8], session: &str) -> Result<Child, String> {
-    use std::io::Write;
-    let mut child = launch_session(executable, "-", session)?;
-    let result = child.stdin.take().ok_or("missing stdin")?.write_all(bytes);
-    if let Err(e) = result {
-        let _ = child.kill();
-        let _ = finish(child);
-        return Err(format!("deliver snapshot: {e}"));
+fn nonblocking(fd: &impl std::os::fd::AsRawFd) -> Result<(), String> {
+    let raw = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
-    Ok(child)
+    Ok(())
 }
-fn drain(mut stream: impl Read) -> (Vec<u8>, bool) {
-    let mut saved = Vec::new();
+fn collect(stream: &mut impl Read, saved: &mut Vec<u8>, overflow: &mut bool) {
     let mut buf = [0; 4096];
-    let mut overflow = false;
-    loop {
+    // Bound work per tick even when a producer never stops writing.
+    for _ in 0..16 {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let keep = n.min((MAX_BYTES as usize).saturating_sub(saved.len()));
                 saved.extend_from_slice(&buf[..keep]);
-                overflow |= keep < n;
+                *overflow |= keep < n;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
-                overflow = true;
+                *overflow = true;
                 break;
             }
         }
     }
-    (saved, overflow)
 }
 // WNOWAIT reserves the leader PID/PGID until all group signals are complete.
 fn exited_unreaped(child: &Child) -> Result<bool, String> {
@@ -78,21 +86,104 @@ fn exited_unreaped(child: &Child) -> Result<bool, String> {
 pub fn finish(child: Child) -> Result<String, String> {
     finish_with_timeout(child, Duration::from_secs(30))
 }
-pub fn finish_with_timeout(mut child: Child, timeout: Duration) -> Result<String, String> {
-    let stdout = child.stdout.take().ok_or("missing stdout")?;
-    let stderr = child.stderr.take().ok_or("missing stderr")?;
-    let out = thread::spawn(move || drain(stdout));
-    let err = thread::spawn(move || drain(stderr));
+pub fn finish_with_timeout(child: Child, timeout: Duration) -> Result<String, String> {
+    finish_controlled(child, &[], timeout, || false)
+}
+/// Only a live Child whose unreaped leader reserves the group may be signaled.
+/// Pipes are nonblocking: escaped pipe holders cannot keep this owner waiting.
+pub fn finish_controlled(
+    child: Child,
+    input: &[u8],
+    timeout: Duration,
+    cancel: impl FnMut() -> bool,
+) -> Result<String, String> {
+    finish_with_grace(child, input, timeout, Duration::from_millis(200), cancel)
+}
+pub fn finish_guard(
+    child: Child,
+    input: &[u8],
+    timeout: Duration,
+    cancel: impl FnMut() -> bool,
+) -> Result<String, String> {
+    finish_owner(
+        child,
+        input,
+        timeout,
+        Duration::from_millis(200),
+        false,
+        cancel,
+    )
+}
+pub fn finish_with_grace(
+    child: Child,
+    input: &[u8],
+    timeout: Duration,
+    grace: Duration,
+    cancel: impl FnMut() -> bool,
+) -> Result<String, String> {
+    finish_owner(child, input, timeout, grace, true, cancel)
+}
+fn finish_owner(
+    mut child: Child,
+    input: &[u8],
+    timeout: Duration,
+    grace: Duration,
+    kill_on_timeout: bool,
+    mut cancel: impl FnMut() -> bool,
+) -> Result<String, String> {
+    use std::io::Write;
+    let mut stdout = child.stdout.take().ok_or("missing stdout")?;
+    let mut stderr = child.stderr.take().ok_or("missing stderr")?;
+    nonblocking(&stdout)?;
+    nonblocking(&stderr)?;
+    let mut stdin = child.stdin.take();
+    if let Some(stream) = &stdin {
+        nonblocking(stream)?;
+    }
+    let mut offset = 0;
+    let (mut bytes, mut diagnostic) = (Vec::new(), Vec::new());
+    let (mut overflow, mut truncated) = (false, false);
     let start = Instant::now();
+    let mut stopping = None;
     let exited = loop {
+        collect(&mut stdout, &mut bytes, &mut overflow);
+        collect(&mut stderr, &mut diagnostic, &mut truncated);
+        if let Some(stream) = &mut stdin {
+            match stream.write(&input[offset..]) {
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    stdin = None;
+                }
+            }
+            if offset == input.len() {
+                stdin = None;
+            }
+        }
         let exited = exited_unreaped(&child)?;
-        if exited || start.elapsed() >= timeout {
-            break exited;
+        if exited {
+            break true;
+        }
+        if stopping.is_none() && (cancel() || start.elapsed() >= timeout) {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            stopping = Some(Instant::now());
+            stdin = None;
+        }
+        if stopping.is_some_and(|t| t.elapsed() >= grace) {
+            break false;
         }
         thread::sleep(Duration::from_millis(10));
     };
-    // The unreaped leader reserves the numeric group identity, even after exit.
-    // Never signal this group after wait() releases that identity.
+    if !exited && !kill_on_timeout {
+        // The guardian may be descheduled while holding its worker Child.
+        // Killing it here could orphan that separate group. Retain uncertainty.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Err("guardian shutdown unconfirmed; execution identity uncertain".into());
+    }
     let signal = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let signal_error = if signal != 0 {
         Some(std::io::Error::last_os_error())
@@ -101,15 +192,17 @@ pub fn finish_with_timeout(mut child: Child, timeout: Duration) -> Result<String
     };
     let status = child.wait().map_err(|e| e.to_string())?;
     if let Some(e) = signal_error {
-        // Darwin can return EPERM for a group containing only the zombie leader.
         let zombie_only =
             cfg!(target_os = "macos") && exited && e.raw_os_error() == Some(libc::EPERM);
         if e.raw_os_error() != Some(libc::ESRCH) && !zombie_only {
             return Err(e.to_string());
         }
     }
-    let (bytes, overflow) = out.join().map_err(|_| "stdout reader panicked")?;
-    let (diagnostic, truncated) = err.join().map_err(|_| "stderr reader panicked")?;
+    collect(&mut stdout, &mut bytes, &mut overflow);
+    collect(&mut stderr, &mut diagnostic, &mut truncated);
+    if stopping.is_some() {
+        return Err("execution canceled or deadline exhausted".into());
+    }
     let diagnostics = format!(
         "stderr{}: {}",
         if truncated { " (truncated)" } else { "" },
@@ -152,6 +245,37 @@ pub fn finish_with_timeout(mut child: Child, timeout: Duration) -> Result<String
             )
         })
         .map_err(|e| format!("{e}; {diagnostics}"))
+}
+
+/// A separate guardian survives service death and retains the worker Child.
+pub fn launch_guard(
+    executable: &Path,
+    session: &str,
+    cwd: Option<&Path>,
+    allowance_ms: u64,
+    input: &[u8],
+) -> Result<Child, String> {
+    use std::os::unix::process::CommandExt;
+    let guard = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name("execution-guard");
+    let mut command = Command::new(guard);
+    command
+        .arg(executable)
+        .arg(allowance_ms.to_string())
+        .arg({
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(input))
+        })
+        .env("AGENTPM_EXECUTION_ID", session)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.spawn().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

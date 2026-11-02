@@ -89,7 +89,8 @@ impl GitService {
             .map_err(|e| e.to_string())?;
         db.busy_timeout(Duration::from_secs(10))
             .map_err(|e| e.to_string())?;
-        db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS allocations (run TEXT NOT NULL, milestone TEXT NOT NULL, branch TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE, head TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e| e.to_string())?;
+        db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS allocations (run TEXT NOT NULL, milestone TEXT NOT NULL, branch TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE, head TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(run,milestone)); CREATE TABLE IF NOT EXISTS handback_reports(run TEXT NOT NULL, milestone TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e| e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS human_ownership(run TEXT NOT NULL, milestone TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e|e.to_string())?;
         // BEGIN IMMEDIATE is held across external effects; persisted intents survive
         // crashes, while all cooperating CLI/supervisor instances serialize here.
         db.execute_batch("BEGIN IMMEDIATE")
@@ -242,6 +243,7 @@ impl GitService {
             &format!("{base}^{{commit}}"),
         ])?;
         let db = self.connection()?;
+        Self::not_human(&db, run, milestone)?;
         if let Some(a) = self.read(&db, run, milestone)? {
             if a.branch != branch || a.expected_head != head || a.state == "cleaned" {
                 return Err("request conflicts with recorded allocation".into());
@@ -319,6 +321,75 @@ impl GitService {
         a.state = "allocated".into();
         Ok(a)
     }
+    fn not_human(db: &Connection, run: &str, milestone: &str) -> Result<()> {
+        let held: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_ownership WHERE run=?1 AND milestone=?2)",
+                params![run, milestone],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if held {
+            return Err("human takeover freezes branch maintenance".into());
+        }
+        Ok(())
+    }
+    /// Cooperating callers share the same immediate transaction as cleanup.
+    pub fn execution_checkout(&self, run: &str, milestone: &str) -> Result<Allocation> {
+        let db = self.connection()?;
+        Self::not_human(&db, run, milestone)?;
+        let a = self
+            .read(&db, run, milestone)?
+            .ok_or("unknown allocation")?;
+        if a.state != "allocated" {
+            return Err("allocation is not dispatchable".into());
+        }
+        self.owned(&a)?;
+        self.checkout_matches(&a)?;
+        Ok(a)
+    }
+    pub fn takeover(&self, run: &str, milestone: &str) -> Result<()> {
+        let db = self.connection()?;
+        self.read(&db, run, milestone)?
+            .ok_or("unknown allocation")?;
+        db.execute(
+            "INSERT OR IGNORE INTO human_ownership VALUES(?1,?2)",
+            params![run, milestone],
+        )
+        .map_err(|e| e.to_string())?;
+        db.execute_batch("COMMIT").map_err(|e| e.to_string())
+    }
+    pub fn handback(&self, run: &str, milestone: &str) -> Result<serde_json::Value> {
+        let db = self.connection()?;
+        let a = self
+            .read(&db, run, milestone)?
+            .ok_or("unknown allocation")?;
+        let head = git(&a.path, ["rev-parse", "HEAD"])?;
+        let branch = git(&a.path, ["symbolic-ref", "HEAD"])?;
+        let edits = git(
+            &a.path,
+            [
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored",
+            ],
+        )?;
+        // Inspection never adopts edits as the expected revision or clean evidence.
+        let report = serde_json::json!({"head":head,"branch":branch,"edits":edits,"evidence_valid":false,"requires_revalidation":true});
+        db.execute(
+            "INSERT OR REPLACE INTO handback_reports VALUES(?1,?2,?3)",
+            params![run, milestone, report.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        db.execute(
+            "DELETE FROM human_ownership WHERE run=?1 AND milestone=?2",
+            params![run, milestone],
+        )
+        .map_err(|e| e.to_string())?;
+        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        Ok(report)
+    }
     pub fn inspect(&self, run: &str, milestone: &str) -> Result<Allocation> {
         let db = self.connection()?;
         self.read(&db, run, milestone)?
@@ -326,6 +397,7 @@ impl GitService {
     }
     pub fn cleanup(&self, run: &str, milestone: &str) -> Result<Allocation> {
         let db = self.connection()?;
+        Self::not_human(&db, run, milestone)?;
         let mut a = self
             .read(&db, run, milestone)?
             .ok_or("unknown allocation")?;

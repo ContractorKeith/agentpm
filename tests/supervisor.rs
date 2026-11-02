@@ -428,6 +428,417 @@ fn schema_two_upgrades_without_inventing_old_snapshots() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),
+        4
+    );
+}
+
+fn controlled(script: String, project: &str, allowance_ms: u64) -> Command {
+    Command::StartControlled {
+        script,
+        project: project.into(),
+        allowance_ms,
+        repository: None,
+        milestone: None,
+    }
+}
+fn terminal(s: &Service, run: &str) -> Value {
+    wait(|| {
+        let v = s.call("show", Command::Show { run: run.into() }).unwrap();
+        (!["queued", "running"].contains(&v["state"].as_str().unwrap())).then_some(v)
+    })
+}
+#[test]
+fn budgets_caps_cancellation_and_persistent_repair_lineage() {
+    let mut s = Service::new();
+    s.call(
+        "policy",
+        Command::Policy {
+            slots: 2,
+            project_cap: 2,
+        },
+    )
+    .unwrap();
+    s.call(
+        "project-a-cap",
+        Command::ProjectCap {
+            project: "a".into(),
+            cap: 1,
+        },
+    )
+    .unwrap();
+    let script = s.script(
+        "long.json",
+        r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
+    );
+    s.call("short", controlled(script.clone(), "a", 120))
+        .unwrap();
+    assert!(s.call("cap", controlled(script.clone(), "a", 500)).is_err());
+    s.call("other", controlled(script.clone(), "b", 10000))
+        .unwrap();
+    assert!(s.call("global", controlled(script, "c", 500)).is_err());
+    assert_eq!(terminal(&s, "short")["state"], "failed");
+    let c = s
+        .call(
+            "c",
+            Command::Controls {
+                run: "short".into(),
+            },
+        )
+        .unwrap();
+    assert!(c["used_ms"].as_u64().unwrap() >= 120);
+    assert!(
+        s.call(
+            "repair-budget",
+            Command::Repair {
+                run: "short".into()
+            }
+        )
+        .is_err()
+    );
+    s.call(
+        "cancel",
+        Command::Cancel {
+            run: "other".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(terminal(&s, "other")["state"], "failed");
+    let script = s.script("fail.json", r#"[{"kind":"failure","reason":"repair me"}]"#);
+    s.call("lineage", controlled(script, "a", 10000)).unwrap();
+    terminal(&s, "lineage");
+    for i in 0..3 {
+        let id = format!("repair-{i}");
+        let response = s
+            .call(
+                &id,
+                Command::Repair {
+                    run: "lineage".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response,
+            s.call(
+                &id,
+                Command::Repair {
+                    run: "lineage".into()
+                }
+            )
+            .unwrap()
+        );
+        terminal(&s, "lineage");
+    }
+    assert!(
+        s.call(
+            "fourth",
+            Command::Repair {
+                run: "lineage".into()
+            }
+        )
+        .unwrap_err()
+        .contains("limit")
+    );
+    for i in 0..3 {
+        s.call(
+            &format!("replan-{i}"),
+            Command::Replan {
+                run: "lineage".into(),
+            },
+        )
+        .unwrap();
+    }
+    assert!(
+        s.call(
+            "replan-four",
+            Command::Replan {
+                run: "lineage".into()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(
+        s.call(
+            "c",
+            Command::Controls {
+                run: "lineage".into()
+            }
+        )
+        .unwrap()["repairs"],
         3
     );
+    s.call(
+        "extend",
+        Command::Extend {
+            run: "short".into(),
+            additional_ms: 1000,
+        },
+    )
+    .unwrap();
+    assert!(
+        s.call(
+            "c",
+            Command::Controls {
+                run: "short".into()
+            }
+        )
+        .unwrap()["used_ms"]
+            .as_u64()
+            .unwrap()
+            >= 120
+    );
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    s.child = Process::new(env!("CARGO_BIN_EXE_agentpm"))
+        .arg("--data-dir")
+        .arg(s.dir.path())
+        .args(["supervisor", "serve"])
+        .spawn()
+        .unwrap();
+    wait(|| s.call("status", Command::Status {}).ok());
+    let controls = s
+        .call(
+            "c",
+            Command::Controls {
+                run: "lineage".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(controls["repairs"], 3);
+    assert_eq!(controls["replans"], 3);
+    assert!(
+        s.call(
+            "fifth",
+            Command::Repair {
+                run: "lineage".into()
+            }
+        )
+        .is_err()
+    );
+}
+#[test]
+fn takeover_stops_worker_and_freezes_cooperative_git_until_inspected_handback() {
+    let s = Service::new();
+    let repo = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init"],
+        vec![
+            "-c",
+            "user.name=Keith",
+            "-c",
+            "user.email=keith@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    ] {
+        assert!(
+            Process::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let git = agentpm::git::GitService::open(repo.path()).unwrap();
+    let a = git.allocate("owned", "m", "agentpm-test", "HEAD").unwrap();
+    let script = s.script(
+        "owned.json",
+        r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
+    );
+    s.call(
+        "owned",
+        Command::StartControlled {
+            script,
+            project: "p".into(),
+            allowance_ms: 10000,
+            repository: Some(repo.path().to_str().unwrap().into()),
+            milestone: Some("m".into()),
+        },
+    )
+    .unwrap();
+    s.call(
+        "take",
+        Command::Takeover {
+            run: "owned".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(terminal(&s, "owned")["state"], "failed");
+    assert!(git.cleanup("owned", "m").unwrap_err().contains("takeover"));
+    assert!(
+        git.allocate("owned", "m", "agentpm-test", "HEAD")
+            .unwrap_err()
+            .contains("takeover")
+    );
+    std::fs::write(a.path.join("human.txt"), "keep me").unwrap();
+    let report = s
+        .call(
+            "back",
+            Command::Handback {
+                run: "owned".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(report["evidence_valid"], false);
+    assert!(report["edits"].as_str().unwrap().contains("human.txt"));
+    assert!(git.cleanup("owned", "m").is_err());
+    assert_eq!(
+        std::fs::read_to_string(a.path.join("human.txt")).unwrap(),
+        "keep me"
+    );
+}
+#[test]
+fn service_crash_retains_slot_exhausts_unknown_allowance_without_duplicate_dispatch() {
+    let mut s = Service::new();
+    s.call(
+        "policy",
+        Command::Policy {
+            slots: 1,
+            project_cap: 1,
+        },
+    )
+    .unwrap();
+    let script = s.script(
+        "crash.json",
+        r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
+    );
+    let first = s
+        .call("crash", controlled(script.clone(), "p", 500))
+        .unwrap();
+    wait(|| {
+        let v = s
+            .call(
+                "show",
+                Command::Show {
+                    run: "crash".into(),
+                },
+            )
+            .unwrap();
+        (v["state"] == "running").then_some(v)
+    });
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    s.child = Process::new(env!("CARGO_BIN_EXE_agentpm"))
+        .arg("--data-dir")
+        .arg(s.dir.path())
+        .args(["supervisor", "serve"])
+        .spawn()
+        .unwrap();
+    wait(|| s.call("status", Command::Status {}).ok());
+    assert_eq!(
+        first,
+        s.call("crash", controlled(script.clone(), "p", 500))
+            .unwrap()
+    );
+    let c = s
+        .call(
+            "controls",
+            Command::Controls {
+                run: "crash".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(c["identity_unknown"], true);
+    assert_eq!(c["used_ms"], 500);
+    assert!(s.call("duplicate", controlled(script, "p", 500)).is_err());
+    assert!(
+        s.call(
+            "take",
+            Command::Takeover {
+                run: "crash".into()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn guardian_retains_deadline_and_reaps_worker_without_service() {
+    use std::{io::Write, process::Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let worker = dir.path().join("worker");
+    let pidfile = dir.path().join("pid");
+    executable(
+        &worker,
+        "#!/bin/sh\necho $$ > \"$PID_FILE\"\ntrap '' TERM\nwhile :; do sleep 10; done\n",
+    );
+    let mut guard = Process::new(env!("CARGO_BIN_EXE_execution-guard"))
+        .arg(worker)
+        .arg("1000")
+        .arg("4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945")
+        .env("PID_FILE", &pidfile)
+        .env("AGENTPM_EXECUTION_ID", "guard-test")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    guard.stdin.take().unwrap().write_all(b"[]").unwrap();
+    let pid: i32 = wait(|| {
+        std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    });
+    let start = Instant::now();
+    assert!(!guard.wait().unwrap().success());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "guardian did not reap worker"
+    );
+}
+#[test]
+fn blocked_input_and_escaped_pipe_holders_cannot_extend_deadline() {
+    use std::{os::unix::process::CommandExt, process::Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("no-input");
+    executable(&exe, "#!/bin/sh\ntrap '' TERM\nsleep 10\n");
+    let child = agentpm::process::launch_session(&exe, "-", "no-input").unwrap();
+    let start = Instant::now();
+    assert!(
+        agentpm::process::finish_controlled(
+            child,
+            &vec![b'x'; 65536],
+            Duration::from_millis(50),
+            || false
+        )
+        .is_err()
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let mut command = Process::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "echo '{\"protocol_version\":1,\"action\":{\"kind\":\"success\"}}'",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            let pid = libc::fork();
+            if pid < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if pid == 0 {
+                libc::setsid();
+                libc::sleep(2);
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    let start = Instant::now();
+    assert!(
+        agentpm::process::finish_with_timeout(child, Duration::from_millis(100))
+            .unwrap()
+            .starts_with("succeeded")
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
 }
