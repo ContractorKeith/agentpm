@@ -14,9 +14,54 @@ struct Cli {
 enum Commands {
     /// Validate a deterministic script through an external fake-agent process.
     Fake { script: String },
+    /// Manage repository-local owned milestone worktrees.
+    Worktree {
+        #[arg(long)]
+        repo: std::path::PathBuf,
+        #[command(subcommand)]
+        action: WorktreeCommand,
+    },
+}
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    Allocate {
+        run: String,
+        milestone: String,
+        branch: String,
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+    },
+    Inspect {
+        run: String,
+        milestone: String,
+    },
+    Cleanup {
+        run: String,
+        milestone: String,
+    },
 }
 fn run() -> Result<bool, String> {
-    let Commands::Fake { script } = Cli::parse().command;
+    let script = match Cli::parse().command {
+        Commands::Fake { script } => script,
+        Commands::Worktree { repo, action } => {
+            let service = agentpm::git::GitService::open(&repo)?;
+            let allocation = match action {
+                WorktreeCommand::Allocate {
+                    run,
+                    milestone,
+                    branch,
+                    base,
+                } => service.allocate(&run, &milestone, &branch, &base)?,
+                WorktreeCommand::Inspect { run, milestone } => service.inspect(&run, &milestone)?,
+                WorktreeCommand::Cleanup { run, milestone } => service.cleanup(&run, &milestone)?,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&allocation).map_err(|e| e.to_string())?
+            );
+            return Ok(false);
+        }
+    };
     let executable = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .with_file_name("fake-agent");
