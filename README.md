@@ -35,3 +35,23 @@ cargo build --workspace --release
 
 Tests launch the real CLI and fake-agent processes without credentials or paid
 APIs. See [M0 contracts](docs/features/v1/m0-contracts.md) for boundaries.
+
+M1 adds a detached local service for fake runs (no real adapters or project
+scheduler). Build both binaries, then use an absolute script path:
+
+```sh
+agentpm --data-dir "$HOME/.agentpm" supervisor start
+agentpm --data-dir "$HOME/.agentpm" run start "$PWD/harness/success.json" --command-id example-1
+agentpm --data-dir "$HOME/.agentpm" run show example-1
+agentpm --data-dir "$HOME/.agentpm" events --cursor 0
+```
+
+The data directory must have mode 700. `supervisor status` reports service PID;
+`supervisor serve` runs in the foreground for service managers. Reuse the same
+command ID and exact payload to retry a start safely. Events return one bounded
+event per page; use its cursor for the next page, stopping at an empty page.
+Service diagnostics are in `supervisor.log`. Fake delay actions use real time
+inside the service; the original `fake` demo retains its virtual clock.
+See [M1 contracts](docs/features/v1/m1-supervisor.md) for limits and recovery
+boundaries. `libc` supplies Unix advisory locking, private file creation and
+termination of newly owned child process groups on macOS/Linux.
