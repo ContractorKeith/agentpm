@@ -58,6 +58,78 @@ enum RunCommand {
     Show {
         run: String,
     },
+    /// Show a run's controls; with --confirm-ended, attest that its unknown execution has ended.
+    Reconcile {
+        run: String,
+        #[arg(long)]
+        confirm_ended: bool,
+        #[arg(long)]
+        command_id: String,
+    },
+    Controls {
+        run: String,
+    },
+    Cancel {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Takeover {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Handback {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Replan {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Repair {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Resume {
+        run: String,
+        #[arg(long)]
+        command_id: String,
+    },
+    Extend {
+        run: String,
+        additional_ms: u64,
+        #[arg(long)]
+        command_id: String,
+    },
+    ProjectCap {
+        project: String,
+        cap: u32,
+        #[arg(long)]
+        command_id: String,
+    },
+    Policy {
+        slots: u32,
+        project_cap: u32,
+        #[arg(long)]
+        command_id: String,
+    },
+    StartControlled {
+        script: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long, default_value = "default")]
+        project: String,
+        #[arg(long, default_value_t = 7_200_000)]
+        allowance_ms: u64,
+        #[arg(long)]
+        repository: Option<String>,
+        #[arg(long)]
+        milestone: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 enum ContextCommand {
@@ -206,6 +278,86 @@ fn run() -> Result<bool, String> {
                 Commands::Run {
                     command: RunCommand::Start { script, command_id },
                 } => (command_id, ServiceCommand::Start { script }),
+                Commands::Run {
+                    command: RunCommand::Resume { run, command_id },
+                } => (command_id, ServiceCommand::Resume { run }),
+                Commands::Run {
+                    command:
+                        RunCommand::Extend {
+                            run,
+                            additional_ms,
+                            command_id,
+                        },
+                } => (command_id, ServiceCommand::Extend { run, additional_ms }),
+                Commands::Run {
+                    command:
+                        RunCommand::ProjectCap {
+                            project,
+                            cap,
+                            command_id,
+                        },
+                } => (command_id, ServiceCommand::ProjectCap { project, cap }),
+                Commands::Run {
+                    command:
+                        RunCommand::Reconcile {
+                            run,
+                            confirm_ended,
+                            command_id,
+                        },
+                } => (
+                    command_id,
+                    if confirm_ended {
+                        ServiceCommand::ConfirmEnded { run }
+                    } else {
+                        ServiceCommand::Reconcile { run }
+                    },
+                ),
+                Commands::Run {
+                    command: RunCommand::Controls { run },
+                } => ("controls".into(), ServiceCommand::Controls { run }),
+                Commands::Run {
+                    command: RunCommand::Cancel { run, command_id },
+                } => (command_id, ServiceCommand::Cancel { run }),
+                Commands::Run {
+                    command: RunCommand::Takeover { run, command_id },
+                } => (command_id, ServiceCommand::Takeover { run }),
+                Commands::Run {
+                    command: RunCommand::Handback { run, command_id },
+                } => (command_id, ServiceCommand::Handback { run }),
+                Commands::Run {
+                    command: RunCommand::Replan { run, command_id },
+                } => (command_id, ServiceCommand::Replan { run }),
+                Commands::Run {
+                    command: RunCommand::Repair { run, command_id },
+                } => (command_id, ServiceCommand::Repair { run }),
+                Commands::Run {
+                    command:
+                        RunCommand::Policy {
+                            slots,
+                            project_cap,
+                            command_id,
+                        },
+                } => (command_id, ServiceCommand::Policy { slots, project_cap }),
+                Commands::Run {
+                    command:
+                        RunCommand::StartControlled {
+                            script,
+                            command_id,
+                            project,
+                            allowance_ms,
+                            repository,
+                            milestone,
+                        },
+                } => (
+                    command_id,
+                    ServiceCommand::StartControlled {
+                        script,
+                        project,
+                        allowance_ms,
+                        repository,
+                        milestone,
+                    },
+                ),
                 Commands::Run {
                     command: RunCommand::Show { run },
                 } => ("show".into(), ServiceCommand::Show { run }),

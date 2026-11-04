@@ -72,7 +72,15 @@ fn reported_outcome_must_match_exact_exit_code() {
             );
             std::fs::write(&executable, script).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let result = agentpm::harness::execute(&request, &executable);
+            // Parallel tests may fork while the script is open for writing (ETXTBSY).
+            let mut result = agentpm::harness::execute(&request, &executable);
+            for _ in 0..50 {
+                if !format!("{result:?}").contains("Text file busy") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                result = agentpm::harness::execute(&request, &executable);
+            }
             assert_eq!(
                 result.is_ok(),
                 code == Some(expected),
