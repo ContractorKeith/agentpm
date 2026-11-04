@@ -89,7 +89,7 @@ fn durable_identity_union_excludes_waits_and_counts_coordinator_once() {
     drop(db);
     let mut db = Connection::open(path).unwrap();
     store::migrate(&mut db).unwrap();
-    execution::recover(&db).unwrap();
+    execution::recover(&db, &[]).unwrap();
     execution::recover_clock(
         &db,
         Stamp {
@@ -154,7 +154,7 @@ fn repeated_recovery_never_reduces_recorded_time_or_releases_unknown_identity() 
     )
     .unwrap();
     for _ in 0..2 {
-        execution::recover(&db).unwrap();
+        execution::recover(&db, &[]).unwrap();
         assert_eq!(execution::show(&db, "r").unwrap()["used_ms"], 750);
     }
     assert_eq!(
@@ -186,7 +186,7 @@ fn waiting_identity_survives_restart_without_charging_human_or_ci_wait() {
     drop(db);
     let mut db = Connection::open(path).unwrap();
     store::migrate(&mut db).unwrap();
-    execution::recover(&db).unwrap();
+    execution::recover(&db, &[]).unwrap();
     execution::recover_clock(
         &db,
         Stamp {
@@ -269,4 +269,92 @@ fn overlapping_identities_exhaust_one_shared_allowance_and_cannot_reset_it() {
     }
     assert!(execution::tick_at(&db, "r", stamp(200)).unwrap());
     assert_eq!(execution::show(&db, "r").unwrap()["used_ms"], 100);
+}
+
+#[test]
+fn known_completion_intervals_count_overlap_once_and_exclude_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+    store::migrate(&mut db).unwrap();
+    seed(&db, "r", 5000);
+    reserve(&mut db, "w1", "worker", 0);
+    state(&mut db, "w1", "active", 0);
+    reserve(&mut db, "w2", "worker", 100);
+    state(&mut db, "w2", "active", 100);
+    // Receipts are consumed long after both ended: [0,200] and [100,400] overlap.
+    let late = Stamp {
+        epoch: "first",
+        ms: 3000,
+    };
+    for (token, elapsed) in [("w1", 200), ("w2", 300)] {
+        apply(&mut db, |tx| {
+            execution::finish_known(tx, token, elapsed, late)
+        })
+        .unwrap();
+    }
+    apply(&mut db, |tx| execution::tick_at(tx, "r", late).map(|_| ())).unwrap();
+    let used: i64 = db
+        .query_row(
+            "SELECT used_ms FROM execution_controls WHERE run='r'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        used, 400,
+        "union of known intervals, no post-completion idle"
+    );
+    // A later, disjoint interval adds only its own length.
+    reserve(&mut db, "w3", "worker", 3000);
+    state(&mut db, "w3", "active", 3000);
+    apply(&mut db, |tx| {
+        execution::finish_known(
+            tx,
+            "w3",
+            150,
+            Stamp {
+                epoch: "first",
+                ms: 9000,
+            },
+        )
+    })
+    .unwrap();
+    let used: i64 = db
+        .query_row(
+            "SELECT used_ms FROM execution_controls WHERE run='r'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, 550);
+}
+
+#[test]
+fn known_completion_after_restart_preserves_recorded_maximum() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+    store::migrate(&mut db).unwrap();
+    seed(&db, "r", 5000);
+    reserve(&mut db, "w1", "worker", 0);
+    state(&mut db, "w1", "active", 0);
+    db.execute(
+        "UPDATE execution_controls SET used_ms=750 WHERE run='r'",
+        [],
+    )
+    .unwrap();
+    // New process epoch: the old start stamp is not comparable, so charge nothing extra.
+    let next = Stamp {
+        epoch: "second",
+        ms: 50,
+    };
+    execution::recover_clock(&db, next).unwrap();
+    apply(&mut db, |tx| execution::finish_known(tx, "w1", 200, next)).unwrap();
+    let used: i64 = db
+        .query_row(
+            "SELECT used_ms FROM execution_controls WHERE run='r'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, 750, "recorded elapsed time never decreases");
 }

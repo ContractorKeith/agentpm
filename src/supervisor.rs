@@ -210,7 +210,7 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             tx.execute("INSERT INTO supervisor_requests VALUES(?1,?2,?3)",params![request.id,encoded,report.to_string()]).map_err(error)?;
             if handback {tx.execute("INSERT INTO handback_transfers VALUES(?1,?2,?3,1)",params![request.id,handback_operation(&tx,&request.id)?,repository]).map_err(error)?;}
             tx.commit().map_err(error)?;
-            if handback { reconcile_handbacks(&conn)?; }
+            if handback && let Some((_, e)) = reconcile_handbacks(&conn)?.into_iter().find(|(r, _)| *r == request.id) { return Err(e); }
             Ok(report)
         },
         Command::Reconcile { run } => crate::execution::show(&conn,&run),
@@ -346,15 +346,43 @@ fn register_attempt(
     .map_err(error)?;
     Ok(())
 }
+/// Durable, deduplicated diagnostic for a run whose reconciliation could not proceed.
+fn attention(db: &Connection, run: &str, reason: &str) {
+    let payload = json!({"kind":"reconciliation_attention","reason":reason}).to_string();
+    let last: Option<String> = db
+        .query_row(
+            "SELECT payload FROM supervisor_events WHERE run=?1 ORDER BY sequence DESC LIMIT 1",
+            [run],
+            |r| r.get(0),
+        )
+        .ok();
+    if last.as_deref() != Some(payload.as_str()) {
+        let _ = db.execute(
+            "INSERT INTO supervisor_events(run,payload) VALUES(?1,?2)",
+            params![run, payload],
+        );
+    }
+}
+/// Each run is recovered on its own: an unavailable repository keeps that run's
+/// reservation and is retried on the next call, never failing unrelated work.
 fn recover_reservations(conn: &mut Connection) -> Result<(), String> {
     let rows=conn.prepare("SELECT f.id,f.session,c.repository,c.milestone FROM fake_runs f JOIN execution_controls c ON c.run=f.id WHERE f.state IN ('queued','running') AND c.repository IS NOT NULL AND c.milestone IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
     for (run, token, repo, milestone) in rows {
-        crate::git::GitService::open(Path::new(&repo))?.attach(conn)?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(error)?;
-        tx.execute("INSERT OR IGNORE INTO repo_claims.execution_reservations(run,milestone,token) SELECT run,milestone,?3 FROM repo_claims.allocations WHERE run=?1 AND milestone=?2",params![run,milestone,token]).map_err(error)?;
-        tx.commit().map_err(error)?;
+        let mut restored = || -> Result<(), String> {
+            crate::git::GitService::open(Path::new(&repo))?.attach(conn)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(error)?;
+            tx.execute("INSERT OR IGNORE INTO repo_claims.execution_reservations(run,milestone,token) SELECT run,milestone,?3 FROM repo_claims.allocations WHERE run=?1 AND milestone=?2",params![run,milestone,token]).map_err(error)?;
+            tx.commit().map_err(error)
+        };
+        if let Err(e) = restored() {
+            attention(
+                conn,
+                &run,
+                &format!("repository reservation not restored: {e}"),
+            );
+        }
     }
     Ok(())
 }
@@ -368,75 +396,121 @@ fn handback_operation(db: &Connection, request: &str) -> Result<String, String> 
         Sha256::digest(serde_json::to_vec(&(path, request)).map_err(error)?)
     ))
 }
-fn reconcile_handbacks(db: &Connection) -> Result<(), String> {
+/// Returns each pending request that could not complete, with its cause; the caller
+/// decides whether a failure concerns the command in hand.
+fn reconcile_handbacks(db: &Connection) -> Result<Vec<(String, String)>, String> {
     let rows = db
-        .prepare("SELECT request_id,operation,repository FROM handback_transfers WHERE pending=1")
+        .prepare("SELECT h.request_id,h.operation,h.repository,coalesce(json_extract(q.command,'$.run'),'') FROM handback_transfers h JOIN supervisor_requests q ON q.id=h.request_id WHERE h.pending=1")
         .map_err(error)?
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })
         .map_err(error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(error)?;
-    for (request, operation, repo) in rows {
-        crate::git::GitService::open(Path::new(&repo))?
-            .complete_handback(&operation, &request, db)?;
-        db.execute(
-            "UPDATE handback_transfers SET pending=0 WHERE request_id=?1",
-            [request],
-        )
-        .map_err(error)?;
-    }
-    Ok(())
-}
-/// Receipts are guardian-owned, nonce/hash-bound, and only published after cleanup.
-fn reconcile(conn: &mut Connection) -> Result<(), String> {
-    let rows=conn.prepare("SELECT i.token,i.run,i.receipt_path,i.snapshot_hash,i.baseline_ms,c.repository FROM execution_identities i JOIN execution_controls c ON c.run=i.run WHERE i.state!='finished' AND i.receipt_path IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
-    for (token, run, path, hash, baseline, repo) in rows {
-        let Some(receipt) = crate::receipt::Receipt::read(Path::new(&path), &token, &hash)? else {
-            continue;
-        };
-        if !receipt.complete {
-            continue;
-        }
-        if let Some(repo) = &repo {
-            crate::git::GitService::open(Path::new(repo))?.attach(conn)?;
-        }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(error)?;
-        crate::execution::transition_at(&tx, &token, "finished", crate::execution::now())?;
-        tx.execute("UPDATE execution_controls SET used_ms=max(used_ms,?2),uncertain=EXISTS(SELECT 1 FROM execution_identities WHERE run=?1 AND state='uncertain') WHERE run=?1",params![run,baseline.saturating_add(receipt.elapsed_ms.min(i64::MAX as u64) as i64)]).map_err(error)?;
-        let state = if receipt.result.is_ok() {
-            "finished"
-        } else {
-            "failed"
-        };
-        let result = receipt.result.unwrap_or_else(|e| e);
-        tx.execute(
-            "UPDATE fake_runs SET state=?2,result=?3 WHERE id=?1 AND session=?4",
-            params![run, state, result, token],
-        )
-        .map_err(error)?;
-        if repo.is_some() {
-            tx.execute(
-                "DELETE FROM repo_claims.execution_reservations WHERE token=?1",
-                [&token],
+    let mut failed = Vec::new();
+    for (request, operation, repo, run) in rows {
+        let done = || -> Result<(), String> {
+            crate::git::GitService::open(Path::new(&repo))?
+                .complete_handback(&operation, &request, db)?;
+            db.execute(
+                "UPDATE handback_transfers SET pending=0 WHERE request_id=?1",
+                [&request],
             )
             .map_err(error)?;
+            Ok(())
+        };
+        // The pending row (and the repository's freeze) persists for the next retry.
+        if let Err(e) = done() {
+            attention(db, &run, &format!("handback completion pending: {e}"));
+            failed.push((request, e));
         }
-        event(
-            &tx,
-            &run,
-            json!({"kind":state,"result":result,"execution":token}),
-        )?;
-        tx.commit().map_err(error)?;
     }
-    Ok(())
+    Ok(failed)
+}
+/// Receipts are guardian-owned, nonce/hash-bound, and only published after cleanup.
+/// A run whose receipt cannot be applied (e.g. unavailable repository) is skipped and
+/// retried; its token is returned so recovery does not classify it as unknown.
+fn reconcile(conn: &mut Connection) -> Result<Vec<String>, String> {
+    let rows=conn.prepare("SELECT i.token,i.run,i.receipt_path,i.snapshot_hash,i.baseline_ms,c.repository FROM execution_identities i JOIN execution_controls c ON c.run=i.run WHERE i.state!='finished' AND i.receipt_path IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
+    let (mut deferred, mut settled, mut blocked) = (Vec::new(), Vec::new(), Vec::new());
+    for (token, run, path, hash, baseline, repo) in rows {
+        let receipt = match crate::receipt::Receipt::read(Path::new(&path), &token, &hash) {
+            Ok(Some(r)) if r.complete => r,
+            Ok(_) => continue,
+            Err(e) => {
+                attention(conn, &run, &format!("guardian receipt unusable: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = apply_receipt(conn, &token, &run, baseline, repo.as_deref(), receipt) {
+            attention(
+                conn,
+                &run,
+                &format!("completed execution not reconciled: {e}"),
+            );
+            deferred.push(token);
+            blocked.push(run);
+        } else {
+            settled.push(run);
+        }
+    }
+    // Known intervals are applied first; only then does the union advance to now.
+    settled.sort();
+    settled.dedup();
+    for run in settled.iter().filter(|r| !blocked.contains(r)) {
+        if let Ok(tx) = conn.transaction() {
+            let _ = crate::execution::tick_at(&tx, run, crate::execution::now());
+            let _ = tx.commit();
+        }
+    }
+    Ok(deferred)
+}
+fn apply_receipt(
+    conn: &mut Connection,
+    token: &str,
+    run: &str,
+    baseline: i64,
+    repo: Option<&str>,
+    receipt: crate::receipt::Receipt,
+) -> Result<(), String> {
+    if let Some(repo) = repo {
+        crate::git::GitService::open(Path::new(repo))?.attach(conn)?;
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(error)?;
+    crate::execution::finish_known(&tx, token, receipt.elapsed_ms, crate::execution::now())?;
+    tx.execute("UPDATE execution_controls SET used_ms=max(used_ms,?2),uncertain=EXISTS(SELECT 1 FROM execution_identities WHERE run=?1 AND state='uncertain') WHERE run=?1",params![run,baseline.saturating_add(receipt.elapsed_ms.min(i64::MAX as u64) as i64)]).map_err(error)?;
+    let state = if receipt.result.is_ok() {
+        "finished"
+    } else {
+        "failed"
+    };
+    let result = receipt.result.unwrap_or_else(|e| e);
+    tx.execute(
+        "UPDATE fake_runs SET state=?2,result=?3 WHERE id=?1 AND session=?4",
+        params![run, state, result, token],
+    )
+    .map_err(error)?;
+    if repo.is_some() {
+        tx.execute(
+            "DELETE FROM repo_claims.execution_reservations WHERE token=?1",
+            [token],
+        )
+        .map_err(error)?;
+    }
+    event(
+        &tx,
+        run,
+        json!({"kind":state,"result":result,"execution":token}),
+    )?;
+    tx.commit().map_err(error)
 }
 fn finish_unlaunched(
     conn: &mut Connection,
@@ -578,10 +652,11 @@ fn dispatch(db: Arc<Mutex<Connection>>, attempt: Dispatch) {
         }
         // Any path without authoritative completion remains reserved/uncertain.
         if let Ok(mut conn) = db.lock() {
-            let _ = reconcile(&mut conn);
+            let deferred = reconcile(&mut conn).unwrap_or_default();
             if let Ok(tx) = conn.transaction() {
                 let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_identities WHERE token=?1 AND state!='finished')",[&token],|r|r.get(0)).unwrap_or(true);
-                if pending {
+                // A complete receipt awaiting its repository is known, not unknown.
+                if pending && !deferred.contains(&token) {
                     let _ = crate::execution::transition_at(
                         &tx,
                         &token,
@@ -713,8 +788,8 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     {
         let mut conn = db.lock().map_err(error)?;
         crate::execution::recover_clock(&conn, crate::execution::now())?;
-        reconcile(&mut conn)?;
-        crate::execution::recover(&conn)?;
+        let deferred = reconcile(&mut conn)?;
+        crate::execution::recover(&conn, &deferred)?;
         recover_reservations(&mut conn)?;
         reconcile_handbacks(&conn)?;
     }

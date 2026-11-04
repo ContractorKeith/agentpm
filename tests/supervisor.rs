@@ -1277,3 +1277,183 @@ fn unknown_historical_execution_keeps_capacity_and_canonical_freeze_without_pid_
     // The deliberately unrelated stored PID is this still-running test process.
     assert_eq!(unsafe { libc::kill(std::process::id() as i32, 0) }, 0);
 }
+
+/// True once the guardian has spawned its worker, i.e. the snapshot was delivered.
+fn worker_started(s: &Service, run: &str) -> bool {
+    let v = s.call("pid", Command::Show { run: run.into() }).unwrap();
+    v["state"] != "queued"
+        && v["pid"].as_u64().is_some_and(|pid| {
+            Process::new("pgrep")
+                .args(["-P", &pid.to_string()])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+        || ["finished", "failed"].contains(&v["state"].as_str().unwrap())
+}
+fn signal(s: &Service, sig: i32) {
+    unsafe {
+        libc::kill(s.child.id() as i32, sig);
+    }
+}
+fn controls(s: &Service, id: &str, run: &str) -> Value {
+    s.call(id, Command::Controls { run: run.into() }).unwrap()
+}
+#[test]
+fn known_completion_interval_is_not_charged_as_supervisor_idle_time() {
+    let s = Service::new();
+    s.call(
+        "fast",
+        controlled(
+            s.script(
+                "fast.json",
+                r#"[{"kind":"delay","milliseconds":200},{"kind":"success"}]"#,
+            ),
+            "p",
+            5000,
+        ),
+    )
+    .unwrap();
+    wait(|| worker_started(&s, "fast").then_some(()));
+    // Only the supervisor stops; the guardian-owned worker completes meanwhile.
+    signal(&s, libc::SIGSTOP);
+    std::thread::sleep(Duration::from_millis(1500));
+    signal(&s, libc::SIGCONT);
+    terminal(&s, "fast");
+    let used = controls(&s, "c", "fast")["used_ms"].as_u64().unwrap();
+    assert!(
+        (150..900).contains(&used),
+        "charged {used}ms for a ~200ms worker"
+    );
+}
+fn two_bound_runs(s: &Service, a: &Path, b: &Path) {
+    for (run, repo) in [("run-a", a), ("run-b", b)] {
+        agentpm::git::GitService::open(repo)
+            .unwrap()
+            .allocate(run, "m", &format!("test-{run}"), "HEAD")
+            .unwrap();
+        s.call(
+            run,
+            bound(
+                s,
+                repo,
+                run,
+                r#"[{"kind":"delay","milliseconds":2500},{"kind":"success"}]"#,
+                5000,
+            ),
+        )
+        .unwrap();
+    }
+    for run in ["run-a", "run-b"] {
+        wait(|| worker_started(s, run).then_some(()));
+    }
+}
+fn unrelated_work_proceeds(s: &Service) {
+    s.call("status-ok", Command::Status {}).unwrap();
+    terminal(s, "run-b");
+    s.call(
+        "unrelated",
+        Command::Start {
+            script: s.script("unrelated.json", r#"[{"kind":"success"}]"#),
+        },
+    )
+    .unwrap();
+    terminal(s, "unrelated");
+}
+fn returns_and_reconciles(s: &Service, a: &Path, moved: &Path) {
+    // Unavailable repository: diagnostics work and the run is not declared unknown.
+    assert_eq!(controls(s, "ca", "run-a")["identity_unknown"], false);
+    std::fs::rename(moved, a).unwrap();
+    let v = terminal(s, "run-a");
+    assert_eq!(v["state"], "finished");
+    let c = controls(s, "cb", "run-a");
+    assert_eq!(c["identity_unknown"], false);
+    assert!(c["used_ms"].as_u64().unwrap() < 4500, "{c}");
+    assert!(cli_cleanup(a, "run-a").status.success());
+}
+#[test]
+fn unavailable_repository_is_isolated_live_and_reconciles_on_return() {
+    let s = Service::new();
+    let (a, b) = (repo(), repo());
+    let moved = a.path().with_extension("moved");
+    two_bound_runs(&s, a.path(), b.path());
+    signal(&s, libc::SIGSTOP);
+    std::thread::sleep(Duration::from_millis(3200));
+    std::fs::rename(a.path(), &moved).unwrap();
+    signal(&s, libc::SIGCONT);
+    unrelated_work_proceeds(&s);
+    // Reservation survives: run-a still holds its slot and has not been failed.
+    assert_eq!(
+        s.call(
+            "show-a",
+            Command::Show {
+                run: "run-a".into()
+            }
+        )
+        .unwrap()["state"],
+        "running"
+    );
+    assert!(has_attention(&s, "run-a"), "durable attention recorded");
+    returns_and_reconciles(&s, a.path(), &moved);
+}
+fn has_attention(s: &Service, run: &str) -> bool {
+    let mut cursor = 0;
+    loop {
+        let v = s.call("ev", Command::Events { cursor }).unwrap();
+        let Some(e) = v["events"].as_array().and_then(|e| e.first().cloned()) else {
+            return false;
+        };
+        cursor = e["cursor"].as_u64().unwrap();
+        if e["run"] == run && e["event"]["kind"] == "reconciliation_attention" {
+            return true;
+        }
+    }
+}
+#[test]
+fn unavailable_handback_repository_does_not_fail_other_commands() {
+    let s = Service::new();
+    {
+        let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+        db.execute("INSERT INTO supervisor_requests VALUES('hb','{\"kind\":\"handback\",\"run\":\"gone\"}','{}')", []).unwrap();
+        db.execute(
+            "INSERT INTO handback_transfers VALUES('hb','op','/nonexistent/repo',1)",
+            [],
+        )
+        .unwrap();
+    }
+    s.call("still-ok", Command::Status {}).unwrap();
+    assert!(has_attention(&s, "gone"));
+    let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
+    let pending: i64 = db
+        .query_row(
+            "SELECT pending FROM handback_transfers WHERE request_id='hb'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1, "retry state is retained");
+}
+#[test]
+fn unavailable_repository_is_isolated_at_startup_and_reconciles_on_return() {
+    let mut s = Service::new();
+    let (a, b) = (repo(), repo());
+    let moved = a.path().with_extension("moved2");
+    two_bound_runs(&s, a.path(), b.path());
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(3200));
+    std::fs::rename(a.path(), &moved).unwrap();
+    restart(&mut s);
+    unrelated_work_proceeds(&s);
+    assert_eq!(
+        s.call(
+            "show-a",
+            Command::Show {
+                run: "run-a".into()
+            }
+        )
+        .unwrap()["state"],
+        "running"
+    );
+    assert!(has_attention(&s, "run-a"), "durable attention recorded");
+    returns_and_reconciles(&s, a.path(), &moved);
+}

@@ -12,11 +12,20 @@ pub fn migrate(db: &Connection) -> rusqlite::Result<()> {
       CREATE TABLE IF NOT EXISTS execution_policy (id INTEGER PRIMARY KEY CHECK(id=1), slots INTEGER NOT NULL, project_cap INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS project_limits(project TEXT PRIMARY KEY, cap INTEGER NOT NULL CHECK(cap BETWEEN 1 AND 3));
       CREATE TABLE IF NOT EXISTS execution_identities(token TEXT PRIMARY KEY,run TEXT NOT NULL REFERENCES fake_runs(id),project TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('worker','coordinator')),state TEXT NOT NULL CHECK(state IN ('reserved','active','waiting','uncertain','finished')),receipt_path TEXT,snapshot_hash TEXT,baseline_ms INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS execution_starts(token TEXT PRIMARY KEY REFERENCES execution_identities(token),epoch TEXT NOT NULL,ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS union_clock(run TEXT PRIMARY KEY REFERENCES fake_runs(id),epoch TEXT NOT NULL,last_ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS handback_transfers(request_id TEXT PRIMARY KEY REFERENCES supervisor_requests(id),operation TEXT NOT NULL UNIQUE,repository TEXT NOT NULL,pending INTEGER NOT NULL CHECK(pending IN (0,1)));
       INSERT OR IGNORE INTO execution_policy VALUES(1,3,3);")
 }
-pub fn recover(db: &Connection) -> Result<(), String> {
+/// `deferred` are identities with a complete guardian receipt whose repository could not
+/// be reconciled yet: they keep their slot but are not classified as unknown.
+pub fn recover(db: &Connection, deferred: &[String]) -> Result<(), String> {
+    db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS deferred(token TEXT PRIMARY KEY); DELETE FROM temp.deferred;")
+        .map_err(|e| e.to_string())?;
+    for token in deferred {
+        db.execute("INSERT OR IGNORE INTO temp.deferred VALUES(?1)", [token])
+            .map_err(|e| e.to_string())?;
+    }
     // Authoritative completions reconcile first. Classify only unresolved
     // execution intervals; PID values and elapsed timers never prove completion.
     db.execute_batch(
@@ -24,14 +33,14 @@ pub fn recover(db: &Connection) -> Result<(), String> {
       INSERT INTO supervisor_events(run,payload)
       SELECT f.id,json_object('kind','recovery_attention','reason','unresolved execution identity; slot retained; allowance conservatively exhausted') FROM fake_runs f
       WHERE NOT EXISTS(SELECT 1 FROM execution_controls c WHERE c.run=f.id AND c.uncertain=1)
-      AND (EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=f.id AND i.state IN ('reserved','active','uncertain'))
+      AND (EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=f.id AND i.state IN ('reserved','active','uncertain') AND i.token NOT IN (SELECT token FROM temp.deferred))
            OR (f.state IN ('queued','running') AND NOT EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=f.id)));
       INSERT OR IGNORE INTO execution_controls(run,project,allowance_ms,used_ms,stop,uncertain)
       SELECT id,'historical',7200000,7200000,1,1 FROM fake_runs WHERE state IN ('queued','running');
       UPDATE execution_controls SET uncertain=1,stop=1,used_ms=max(used_ms,allowance_ms)
-      WHERE EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=execution_controls.run AND i.state IN ('reserved','active','uncertain'))
+      WHERE EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=execution_controls.run AND i.state IN ('reserved','active','uncertain') AND i.token NOT IN (SELECT token FROM temp.deferred))
          OR (run IN (SELECT id FROM fake_runs WHERE state IN ('queued','running')) AND NOT EXISTS(SELECT 1 FROM execution_identities i WHERE i.run=execution_controls.run));
-      UPDATE execution_identities SET state='uncertain' WHERE state IN ('reserved','active'); COMMIT;",
+      UPDATE execution_identities SET state='uncertain' WHERE state IN ('reserved','active') AND token NOT IN (SELECT token FROM temp.deferred); COMMIT;",
     )
     .map_err(|e| e.to_string())
 }
@@ -191,6 +200,13 @@ pub fn transition_at(
             }
         }
     }
+    if state == "active" {
+        db.execute(
+            "INSERT OR IGNORE INTO execution_starts VALUES(?1,?2,?3)",
+            params![token, stamp.epoch, stamp.ms],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     db.execute(
         "UPDATE execution_identities SET state=?2 WHERE token=?1",
         params![token, state],
@@ -208,4 +224,39 @@ pub fn recover_clock(db: &Connection, stamp: Stamp<'_>) -> Result<(), String> {
 }
 pub fn checkpoint(db: &Connection, run: &str, _elapsed_ms: u64) -> Result<bool, String> {
     tick_at(db, run, now())
+}
+/// Finish an identity whose authoritative receipt proves how long it ran. The union is
+/// charged only up to that known end when the start was stamped on this clock; the
+/// caller ticks to `now` after every receipt of the run is applied. An unknown end
+/// (other epoch, pre-upgrade row) is charged conservatively to `now`.
+pub fn finish_known(
+    db: &Connection,
+    token: &str,
+    elapsed_ms: u64,
+    now: Stamp<'_>,
+) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+    let start: Option<(String, i64, i64)> = db
+        .query_row(
+            "SELECT s.epoch,s.ms,u.last_ms FROM execution_starts s JOIN execution_identities i ON i.token=s.token JOIN union_clock u ON u.run=i.run AND u.epoch=s.epoch WHERE s.token=?1",
+            [token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let ms = match start {
+        Some((epoch, started, last)) if epoch == now.epoch => started
+            .saturating_add(elapsed_ms.min(i64::MAX as u64) as i64)
+            .clamp(last, now.ms.max(last)),
+        _ => now.ms,
+    };
+    transition_at(
+        db,
+        token,
+        "finished",
+        Stamp {
+            epoch: now.epoch,
+            ms,
+        },
+    )
 }

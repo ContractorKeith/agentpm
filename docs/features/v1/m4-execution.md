@@ -55,6 +55,24 @@ it does not introduce another clock or reset counters. Restart preserves the
 maximum recorded time, changes clock epoch explicitly, and conservatively
 charges unknown active intervals. Known waiting intervals stay excluded.
 
+Each identity's activation is stamped on that clock. When a guardian receipt
+proves how long the execution ran, `execution::finish_known` charges the union
+only up to that known end (start plus receipt elapsed time), so a stopped or
+delayed supervisor does not bill post-completion idle time; overlapping
+identities are still counted once. The union then advances to now. An end that
+cannot be placed on the current clock (restart, pre-upgrade row) is charged
+conservatively and never lowers recorded time.
+
+## Per-run reconciliation isolation
+
+Receipt, reservation and handback recovery run per run. An unavailable
+repository (renamed, removed, permission denied) skips only that run: its slot,
+canonical reservation and pending handback persist, a deduplicated
+`reconciliation_attention` event records the cause, and the work retries on every
+later command and startup. Status, show, events, unrelated starts and supervisor
+restart are unaffected. A run with a complete receipt awaiting its repository is
+not classified as unknown at startup, so it is not charged its whole allowance.
+
 ## Process ownership and recovery
 
 `run cancel RUN --command-id ID` requests shutdown. Nonblocking stdin/stdout/
