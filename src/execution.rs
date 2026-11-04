@@ -15,7 +15,13 @@ pub fn migrate(db: &Connection) -> rusqlite::Result<()> {
       CREATE TABLE IF NOT EXISTS execution_starts(token TEXT PRIMARY KEY REFERENCES execution_identities(token),epoch TEXT NOT NULL,ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS union_clock(run TEXT PRIMARY KEY REFERENCES fake_runs(id),epoch TEXT NOT NULL,last_ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS handback_transfers(request_id TEXT PRIMARY KEY REFERENCES supervisor_requests(id),operation TEXT NOT NULL UNIQUE,repository TEXT NOT NULL,pending INTEGER NOT NULL CHECK(pending IN (0,1)));
-      INSERT OR IGNORE INTO execution_policy VALUES(1,3,3);")
+      INSERT OR IGNORE INTO execution_policy VALUES(1,3,3);
+      -- Runs written before controls existed: usage is unknown, never zero, so the default
+      -- allowance counts as consumed and dispatch stays stopped until a human extends it.
+      -- Their completion is recorded, so ownership is not unknown. Queued/running rows are
+      -- classified as unknown by recover().
+      INSERT OR IGNORE INTO execution_controls(run,project,allowance_ms,used_ms,stop,uncertain)
+      SELECT id,'default',7200000,7200000,1,0 FROM fake_runs WHERE state NOT IN ('queued','running');")
 }
 /// `deferred` are identities with a complete guardian receipt whose repository could not
 /// be reconciled yet: they keep their slot but are not classified as unknown.

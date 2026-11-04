@@ -51,6 +51,24 @@ where
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
+/// Resolve a worktree's HEAD with a diagnosis instead of raw git stderr.
+fn worktree_head(path: &Path) -> Result<String> {
+    git(path, ["rev-parse", "--verify", "-q", "HEAD"]).map_err(|_| {
+        format!(
+            "worktree HEAD cannot be resolved: its branch was deleted or the checkout is damaged; work in {} is preserved, inspect it before any further action",
+            path.display()
+        )
+    })
+}
+/// Resolve the branch a worktree is on; a detached HEAD is reported, not leaked.
+fn worktree_branch(path: &Path) -> Result<String> {
+    git(path, ["symbolic-ref", "-q", "HEAD"]).map_err(|_| {
+        format!(
+            "worktree is on a detached HEAD, not its allocated branch; work in {} is preserved, check the branch out again or reconcile revisions explicitly",
+            path.display()
+        )
+    })
+}
 fn identifier(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 80
@@ -179,7 +197,7 @@ impl GitService {
         if common != self.common
             || !gitdir.starts_with(self.common.join("worktrees"))
             || gitdir == self.common
-            || git(&a.path, ["symbolic-ref", "HEAD"])? != format!("refs/heads/{}", a.branch)
+            || worktree_branch(&a.path)? != format!("refs/heads/{}", a.branch)
         {
             return Err("worktree identity or branch changed; refusing mutation".into());
         }
@@ -209,7 +227,7 @@ impl GitService {
                 "worktree has assume-unchanged or skip-worktree entries; preserving it".into(),
             );
         }
-        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+        if worktree_head(&a.path)? != a.expected_head
             || !git(
                 &a.path,
                 [
@@ -309,7 +327,7 @@ impl GitService {
             )?;
         }
         self.checkout_matches(&a)?;
-        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+        if worktree_head(&a.path)? != a.expected_head
             || self.head(&format!("refs/heads/{}", a.branch)).as_deref() != Some(&a.expected_head)
         {
             return Err("allocation revision changed; preserving it for reconciliation".into());
@@ -362,7 +380,7 @@ impl GitService {
         Ok(a)
     }
     fn expected_revision(&self, a: &Allocation) -> Result<()> {
-        if git(&a.path, ["rev-parse", "HEAD"])? != a.expected_head
+        if worktree_head(&a.path)? != a.expected_head
             || self.head(&format!("refs/heads/{}", a.branch)).as_deref() != Some(&a.expected_head)
         {
             return Err(
@@ -469,8 +487,8 @@ impl GitService {
         let a = self
             .read(&db, run, milestone)?
             .ok_or("unknown allocation")?;
-        let head = git(&a.path, ["rev-parse", "HEAD"])?;
-        let branch = git(&a.path, ["symbolic-ref", "HEAD"])?;
+        let head = worktree_head(&a.path)?;
+        let branch = worktree_branch(&a.path)?;
         let edits = git(
             &a.path,
             [

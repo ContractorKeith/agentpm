@@ -6,6 +6,16 @@ process identities or completion evidence. Repairs retain the run, immutable
 input, consumed time and three repair credits. Three run replan credits also
 survive restart. Exact mutation retries never launch or spend twice.
 
+Runs written by the earlier schema have no controls. Migration gives each
+completed (non-queued, non-running) run a row with project `default`, the
+two-hour default allowance counted as fully consumed, dispatch stopped and
+ownership known: usage is unknown, never zero, so `run extend` is required
+before repair or resume. Queued or running old rows are classified as unknown
+identities by recovery. Naming a run that does not exist returns
+`unknown run '<id>'`. A detached or unresolvable worktree HEAD (branch deleted
+underneath it) is reported as a diagnosis; the work stays preserved.
+Downgrading to a build that predates schema 5 is unsupported.
+
 ## Dispatch, reservations and revisions
 
 `run start SCRIPT --command-id RUN` retains the two-hour default.

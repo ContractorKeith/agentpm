@@ -132,6 +132,33 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             Err(e) => return Err(error(e)),
         }
     }
+    let named = match &request.command {
+        Command::Takeover { run }
+        | Command::Handback { run }
+        | Command::Controls { run }
+        | Command::Cancel { run }
+        | Command::Replan { run }
+        | Command::Repair { run }
+        | Command::Resume { run }
+        | Command::Extend { run, .. }
+        | Command::Show { run }
+        | Command::Reconcile { run } => Some(run),
+        _ => None,
+    };
+    if let Some(run) = named {
+        let known: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fake_runs WHERE id=?1)",
+                [run],
+                |r| r.get(0),
+            )
+            .map_err(error)?;
+        if !known {
+            return Err(format!(
+                "unknown run '{run}'; list or start runs to get a valid id"
+            ));
+        }
+    }
     let (project, allowance) = match &request.command {
         Command::StartControlled {
             project,

@@ -315,3 +315,26 @@ fn cleanup_receipt_reconciles_after_refs_are_deleted() {
     assert_eq!(s.cleanup("r", "m").unwrap().state, "cleaned");
     assert!(!a.path.exists());
 }
+
+#[test]
+fn detached_or_unborn_worktrees_get_a_diagnosis_not_raw_git_stderr() {
+    let t = repo();
+    let service = GitService::open(t.path()).unwrap();
+    let a = service.allocate("r", "m", "diag", "HEAD").unwrap();
+    git(&a.path, &["checkout", "--detach"]);
+    let e = service.execution_checkout("r", "m").unwrap_err();
+    assert!(e.contains("detached") && !e.contains("fatal:"), "{e}");
+    git(&a.path, &["checkout", "diag"]);
+    service.execution_checkout("r", "m").unwrap();
+    // The branch disappears underneath the checkout.
+    git(t.path(), &["update-ref", "-d", "refs/heads/diag"]);
+    for e in [
+        service.execution_checkout("r", "m").unwrap_err(),
+        service.cleanup("r", "m").unwrap_err(),
+    ] {
+        assert!(
+            e.contains("branch was deleted") && !e.contains("fatal:"),
+            "{e}"
+        );
+    }
+}

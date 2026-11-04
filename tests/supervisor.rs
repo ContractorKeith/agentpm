@@ -20,6 +20,9 @@ impl Service {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self::in_dir(dir)
+    }
+    fn in_dir(dir: tempfile::TempDir) -> Self {
         let child = Process::new(env!("CARGO_BIN_EXE_agentpm"))
             .arg("--data-dir")
             .arg(dir.path())
@@ -470,12 +473,20 @@ fn budgets_caps_cancellation_and_persistent_repair_lineage() {
         "long.json",
         r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
     );
-    s.call("short", controlled(script.clone(), "a", 120))
+    // Long-lived holders make the cap/global rejections independent of timing.
+    s.call("hold", controlled(script.clone(), "a", 10000))
         .unwrap();
     assert!(s.call("cap", controlled(script.clone(), "a", 500)).is_err());
     s.call("other", controlled(script.clone(), "b", 10000))
         .unwrap();
-    assert!(s.call("global", controlled(script, "c", 500)).is_err());
+    assert!(
+        s.call("global", controlled(script.clone(), "c", 500))
+            .is_err()
+    );
+    s.call("cancel-hold", Command::Cancel { run: "hold".into() })
+        .unwrap();
+    assert_eq!(terminal(&s, "hold")["state"], "failed");
+    s.call("short", controlled(script, "a", 120)).unwrap();
     assert_eq!(terminal(&s, "short")["state"], "failed");
     let c = s
         .call(
@@ -1456,4 +1467,77 @@ fn unavailable_repository_is_isolated_at_startup_and_reconciles_on_return() {
     );
     assert!(has_attention(&s, "run-a"), "durable attention recorded");
     returns_and_reconciles(&s, a.path(), &moved);
+}
+
+fn every_control(run: &str) -> Vec<Command> {
+    let run = || run.to_string();
+    vec![
+        Command::Show { run: run() },
+        Command::Controls { run: run() },
+        Command::Reconcile { run: run() },
+        Command::Cancel { run: run() },
+        Command::Replan { run: run() },
+        Command::Repair { run: run() },
+        Command::Resume { run: run() },
+        Command::Extend {
+            run: run(),
+            additional_ms: 1000,
+        },
+        Command::Takeover { run: run() },
+        Command::Handback { run: run() },
+    ]
+}
+#[test]
+fn unknown_run_ids_get_a_sentence_naming_the_run() {
+    let s = Service::new();
+    for (i, command) in every_control("ghost-run").into_iter().enumerate() {
+        let e = s.call(&format!("ghost-{i}"), command).unwrap_err();
+        assert!(e.contains("unknown run") && e.contains("ghost-run"), "{e}");
+        assert!(!e.contains("no rows"), "{e}");
+    }
+}
+#[test]
+fn runs_created_by_the_previous_schema_remain_controllable_after_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        // The schema-3 database origin/main writes: no execution_controls rows.
+        let db = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.execute_batch(include_str!("../src/schema.sql")).unwrap();
+        db.execute_batch(include_str!("../src/supervisor-schema.sql"))
+            .unwrap();
+        db.execute_batch("ALTER TABLE fake_runs ADD COLUMN script_bytes BLOB; PRAGMA user_version=3;
+          INSERT INTO fake_runs(id,state,result,operation,session,cwd,executable,created_at) VALUES('old-done','finished','ok','old-done','old-done','/','/fake','then');
+          INSERT INTO fake_runs(id,state,result,operation,session,cwd,executable,created_at) VALUES('old-failed','failed','bad','old-failed','old-failed','/','/fake','then');").unwrap();
+    }
+    let s = Service::in_dir(dir);
+    for run in ["old-done", "old-failed"] {
+        let c = s
+            .call(&format!("c-{run}"), Command::Controls { run: run.into() })
+            .unwrap();
+        // Usage is unknown, never zero: the migrated allowance counts as consumed.
+        assert_eq!(c["used_ms"], c["allowance_ms"], "{c}");
+        assert_eq!(c["identity_unknown"], false);
+        for (i, command) in every_control(run).into_iter().enumerate() {
+            if let Err(e) = s.call(&format!("{run}-{i}"), command) {
+                assert!(!e.contains("no rows"), "{run} command {i}: {e}");
+            }
+        }
+        // A human extension restores headroom for the migrated run.
+        let before = s
+            .call(&format!("b-{run}"), Command::Controls { run: run.into() })
+            .unwrap()["allowance_ms"]
+            .as_u64()
+            .unwrap();
+        let c = s
+            .call(
+                &format!("ext-{run}"),
+                Command::Extend {
+                    run: run.into(),
+                    additional_ms: 5000,
+                },
+            )
+            .unwrap();
+        assert_eq!(c["allowance_ms"].as_u64().unwrap(), before + 5000);
+    }
 }
