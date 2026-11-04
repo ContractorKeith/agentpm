@@ -336,5 +336,12 @@ fn detached_or_unborn_worktrees_get_a_diagnosis_not_raw_git_stderr() {
             e.contains("branch was deleted") && !e.contains("fatal:"),
             "{e}"
         );
+        // The way forward is in the message, and it works.
+        assert!(
+            e.contains(&format!("branch diag {}", a.expected_head)),
+            "{e}"
+        );
     }
+    git(&a.path, &["branch", "diag", &a.expected_head]);
+    service.execution_checkout("r", "m").unwrap();
 }

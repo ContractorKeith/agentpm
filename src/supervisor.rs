@@ -82,6 +82,10 @@ pub enum Command {
     Reconcile {
         run: String,
     },
+    /// Human attestation that an unknown execution has ended; releases its slot and reservation.
+    ConfirmEnded {
+        run: String,
+    },
     Status {},
 }
 fn error(e: impl std::fmt::Display) -> String {
@@ -91,6 +95,12 @@ fn open(dir: &Path) -> Result<Connection, String> {
     let mut db = Connection::open(dir.join("state.sqlite")).map_err(error)?;
     crate::store::migrate(&mut db).map_err(error)?;
     Ok(db)
+}
+/// The supported human path out of an unknown execution identity.
+fn confirm_hint(run: &str) -> String {
+    format!(
+        "after verifying the execution has ended, attest it with `agentpm run reconcile {run} --confirm-ended --command-id <ID>`"
+    )
 }
 fn event(db: &Connection, run: &str, payload: Value) -> Result<(), String> {
     db.execute(
@@ -142,7 +152,8 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
         | Command::Resume { run }
         | Command::Extend { run, .. }
         | Command::Show { run }
-        | Command::Reconcile { run } => Some(run),
+        | Command::Reconcile { run }
+        | Command::ConfirmEnded { run } => Some(run),
         _ => None,
     };
     if let Some(run) = named {
@@ -205,7 +216,7 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
         },
         Command::Takeover { run } | Command::Handback { run } => {
             let (repository, milestone, uncertain): (Option<String>,Option<String>,bool) = conn.query_row("SELECT repository,milestone,uncertain FROM execution_controls WHERE run=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(error)?;
-            if uncertain { return Err("unknown execution identity requires human reconciliation; exclusive ownership cannot be proven".into()); }
+            if uncertain { return Err(format!("unknown execution identity requires human reconciliation; exclusive ownership cannot be proven; {}",confirm_hint(&run))); }
             let repository=repository.ok_or("run has no worktree binding")?;
             let service = crate::git::GitService::open(Path::new(&repository))?;
             let milestone = milestone.ok_or("run has no milestone binding")?;
@@ -241,6 +252,23 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             Ok(report)
         },
         Command::Reconcile { run } => crate::execution::show(&conn,&run),
+        Command::ConfirmEnded { run } => {
+            let (repo, unknown): (Option<String>, bool) = conn.query_row("SELECT repository,uncertain FROM execution_controls WHERE run=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
+            if !unknown { return Err(format!("run '{run}' has no unknown execution identity; use `agentpm run cancel {run} --command-id <ID>` to stop a known execution")); }
+            if let Some(repo) = &repo { crate::git::GitService::open(Path::new(repo))?.attach(&conn)?; }
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
+            let released: Vec<String> = tx.prepare("SELECT token FROM execution_identities WHERE run=?1 AND state!='finished'").map_err(error)?.query_map([&run],|r|r.get(0)).map_err(error)?.collect::<rusqlite::Result<_>>().map_err(error)?;
+            tx.execute("UPDATE execution_identities SET state='finished' WHERE run=?1 AND state!='finished'",[&run]).map_err(error)?;
+            // Conservative accounting: the allowance stays consumed and dispatch stopped until extended.
+            tx.execute("UPDATE execution_controls SET uncertain=0,stop=1,used_ms=max(used_ms,allowance_ms) WHERE run=?1",[&run]).map_err(error)?;
+            tx.execute("UPDATE fake_runs SET state='failed',result='execution ended; confirmed by human attestation' WHERE id=?1 AND state IN ('queued','running')",[&run]).map_err(error)?;
+            if repo.is_some() { tx.execute("DELETE FROM repo_claims.execution_reservations WHERE run=?1",[&run]).map_err(error)?; }
+            event(&tx,&run,json!({"kind":"human_attested_execution_ended","released_identities":released}))?;
+            let response = crate::execution::show(&tx,&run)?;
+            tx.execute("INSERT INTO supervisor_requests VALUES(?1,?2,?3)",params![request.id,encoded,response.to_string()]).map_err(error)?;
+            tx.commit().map_err(error)?;
+            Ok(response)
+        },
         Command::Controls { run } => crate::execution::show(&conn, &run),
         Command::Cancel { ref run } | Command::Replan { ref run } => {
             let tx = conn.transaction().map_err(error)?;
@@ -259,7 +287,10 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
         },
         Command::Extend { run, additional_ms } => {
             let active: bool = conn.query_row("SELECT state IN ('queued','running') FROM fake_runs WHERE id=?1",[&run],|r|r.get(0)).map_err(error)?;
-            if active { return Err("stop execution before extending its allowance".into()); }
+            if active {
+                if crate::execution::show(&conn,&run)?["identity_unknown"]==true { return Err(format!("unknown execution identity holds this run; {}",confirm_hint(&run))); }
+                return Err(format!("stop execution before extending its allowance (`agentpm run cancel {run} --command-id <ID>`)"));
+            }
             if additional_ms == 0 || additional_ms>i64::MAX as u64 { return Err("invalid extension".into()); }
             let controls = crate::execution::show(&conn,&run)?;
             let allowance = controls["allowance_ms"].as_u64().ok_or("unknown allowance")?;
@@ -274,7 +305,12 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
         },
         Command::Repair { run } | Command::Resume { run } => {
             let controls = crate::execution::show(&conn,&run)?;
-            if (!is_resume && controls["stop"] == true) || controls["identity_unknown"] == true || controls["human_owned"] == true { return Err("run requires human reconciliation or extension".into()); }
+            if controls["identity_unknown"] == true { return Err(format!("unknown execution identity requires human reconciliation; {}",confirm_hint(&run))); }
+            if controls["human_owned"] == true { return Err(format!("run is under human ownership; hand it back first with `agentpm run handback {run} --command-id <ID>`")); }
+            let busy: bool = conn.query_row("SELECT state IN ('queued','running') FROM fake_runs WHERE id=?1",[&run],|r|r.get(0)).map_err(error)?;
+            if busy { return Err("attempt is still active".into()); }
+            if controls["used_ms"].as_u64() >= controls["allowance_ms"].as_u64() { return Err(format!("execution budget exhausted; extend the allowance first with `agentpm run extend {run} <ADDITIONAL_MS> --command-id <ID>`")); }
+            if !is_resume && controls["stop"] == true { return Err(format!("run was stopped; continue it with `agentpm run resume {run} --command-id <ID>`")); }
             let project = controls["project"].as_str().ok_or("missing project")?;
             crate::execution::admit(&conn,project)?;
             let (state, bytes, cwd, executable): (String,Option<Vec<u8>>,String,String) = conn.query_row("SELECT state,script_bytes,cwd,executable FROM fake_runs WHERE id=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(error)?;

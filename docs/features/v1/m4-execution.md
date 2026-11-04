@@ -10,11 +10,37 @@ Runs written by the earlier schema have no controls. Migration gives each
 completed (non-queued, non-running) run a row with project `default`, the
 two-hour default allowance counted as fully consumed, dispatch stopped and
 ownership known: usage is unknown, never zero, so `run extend` is required
-before repair or resume. Queued or running old rows are classified as unknown
-identities by recovery. Naming a run that does not exist returns
-`unknown run '<id>'`. A detached or unresolvable worktree HEAD (branch deleted
-underneath it) is reported as a diagnosis; the work stays preserved.
-Downgrading to a build that predates schema 5 is unsupported.
+before repair or resume. Queued or running old rows are classified by startup
+recovery as unknown identities under project `historical`, with the allowance
+consumed, dispatch stopped and the worker slot retained. Naming a run that does
+not exist returns `unknown run '<id>'`. Downgrading to a build that predates
+schema 5 is unsupported.
+
+## Human reconciliation of an unknown execution
+
+An identity is unknown after a crash or upgrade with no authoritative guardian
+receipt, or when a guardian dies without one. It stays frozen: a PID or timer
+never proves it ended, so the slot and any repository reservation are retained
+and takeover, handback, repair, resume and extend refuse, each naming the way
+out. The supported path is a human attestation:
+
+`agentpm run reconcile RUN --confirm-ended --command-id ID`
+
+Verify first (for example that the orphaned worker is gone). The command refuses
+a run whose identity is known; use `run cancel` for those. In one transaction it
+records a `human_attested_execution_ended` event listing the released
+identities, marks them finished, moves a queued/running run to `failed`, keeps
+the allowance consumed and dispatch stopped, and releases the canonical
+repository reservation. Afterwards the run behaves as a stopped one: `run
+extend`, `run resume`/`run repair` (with a recorded script) and worktree cleanup
+work, and the freed slot admits new runs. Replaying the command id is
+idempotent.
+
+Resume and repair report an exhausted allowance with the same message naming
+`run extend`. A worktree whose branch was deleted underneath it reports how to
+recover: recreate the branch at the recorded head with the quoted
+`git -C PATH branch BRANCH HEAD` (the work stays preserved); if ownership is
+also unknown, attest first.
 
 ## Dispatch, reservations and revisions
 

@@ -211,6 +211,16 @@ fn mismatch_lock_and_diagnostics() {
         }));
     }
 }
+/// Parallel tests may fork while a script is open for writing (ETXTBSY); retry the launch.
+fn launch_retry<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    for _ in 0..50 {
+        match f() {
+            Err(e) if e.contains("Text file busy") => std::thread::sleep(Duration::from_millis(20)),
+            other => return other,
+        }
+    }
+    f()
+}
 fn executable(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -223,8 +233,10 @@ fn excessive_stderr_and_stdout_are_drained_and_bounded() {
         &exe,
         "#!/bin/sh\ni=0; while [ $i -lt 30000 ]; do echo diagnostic-line >&2; i=$((i+1)); done\necho '{\"protocol_version\":1,\"action\":{\"kind\":\"success\"}}'\n",
     );
-    let result =
-        agentpm::process::finish(agentpm::process::launch(&exe, "unused").unwrap()).unwrap();
+    let result = agentpm::process::finish(
+        launch_retry(|| agentpm::process::launch(&exe, "unused")).unwrap(),
+    )
+    .unwrap();
     assert!(result.contains("succeeded"));
     assert!(result.contains("truncated"));
     assert!(result.len() < 70000);
@@ -233,9 +245,11 @@ fn excessive_stderr_and_stdout_are_drained_and_bounded() {
         "#!/bin/sh\ni=0; while [ $i -lt 30000 ]; do echo excessive-output; i=$((i+1)); done\n",
     );
     assert!(
-        agentpm::process::finish(agentpm::process::launch(&exe, "unused").unwrap())
-            .unwrap_err()
-            .contains("exceeds")
+        agentpm::process::finish(
+            launch_retry(|| agentpm::process::launch(&exe, "unused")).unwrap()
+        )
+        .unwrap_err()
+        .contains("exceeds")
     );
 }
 #[test]
@@ -809,7 +823,7 @@ fn blocked_input_and_escaped_pipe_holders_cannot_extend_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("no-input");
     executable(&exe, "#!/bin/sh\ntrap '' TERM\nsleep 10\n");
-    let child = agentpm::process::launch_session(&exe, "-", "no-input").unwrap();
+    let child = launch_retry(|| agentpm::process::launch_session(&exe, "-", "no-input")).unwrap();
     let start = Instant::now();
     assert!(
         agentpm::process::finish_controlled(
@@ -1540,4 +1554,214 @@ fn runs_created_by_the_previous_schema_remain_controllable_after_upgrade() {
             .unwrap();
         assert_eq!(c["allowance_ms"].as_u64().unwrap(), before + 5000);
     }
+}
+
+const CONFIRM: &str = "--confirm-ended";
+fn confirm(s: &Service, id: &str, run: &str) -> Result<Value, String> {
+    s.call(id, Command::ConfirmEnded { run: run.into() })
+}
+#[test]
+fn execution_in_flight_at_upgrade_has_a_human_path_out() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        // origin/main database with an execution still running when it was upgraded.
+        let db = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.execute_batch(include_str!("../src/schema.sql")).unwrap();
+        db.execute_batch(include_str!("../src/supervisor-schema.sql"))
+            .unwrap();
+        db.execute_batch(
+            "ALTER TABLE fake_runs ADD COLUMN script_bytes BLOB; PRAGMA user_version=3;",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO fake_runs(id,state,operation,pid,session,cwd,executable,created_at,script_bytes) VALUES('oldrun','running','oldrun',999999,'oldrun','/',?1,'then',?2)",
+            rusqlite::params![env!("CARGO_BIN_EXE_fake-agent"), br#"[{"kind":"success"}]"#.to_vec()],
+        )
+        .unwrap();
+    }
+    let s = Service::in_dir(dir);
+    let c = controls(&s, "c0", "oldrun");
+    assert_eq!(c["identity_unknown"], true);
+    assert_eq!(c["project"], "historical");
+    // Every refusal names the supported command.
+    for (i, command) in [
+        Command::Takeover {
+            run: "oldrun".into(),
+        },
+        Command::Handback {
+            run: "oldrun".into(),
+        },
+        Command::Repair {
+            run: "oldrun".into(),
+        },
+        Command::Resume {
+            run: "oldrun".into(),
+        },
+        Command::Extend {
+            run: "oldrun".into(),
+            additional_ms: 1000,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let e = s.call(&format!("refuse-{i}"), command).unwrap_err();
+        assert!(e.contains(CONFIRM) && e.contains("oldrun"), "{e}");
+    }
+    let done = confirm(&s, "attest", "oldrun").unwrap();
+    assert_eq!(done["identity_unknown"], false);
+    // Replay is idempotent; a different payload under the same id is refused.
+    assert_eq!(done, confirm(&s, "attest", "oldrun").unwrap());
+    assert_eq!(
+        s.call(
+            "show-old",
+            Command::Show {
+                run: "oldrun".into()
+            }
+        )
+        .unwrap()["state"],
+        "failed"
+    );
+    assert!(has_event(&s, "oldrun", "human_attested_execution_ended"));
+    // The slot is free and the run behaves like a stopped one.
+    s.call(
+        "ext",
+        Command::Extend {
+            run: "oldrun".into(),
+            additional_ms: 600000,
+        },
+    )
+    .unwrap();
+    s.call(
+        "res",
+        Command::Resume {
+            run: "oldrun".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(terminal(&s, "oldrun")["state"], "finished");
+    // A known, healthy identity cannot be attested away.
+    assert!(confirm(&s, "again", "oldrun").is_err());
+}
+fn has_event(s: &Service, run: &str, kind: &str) -> bool {
+    let mut cursor = 0;
+    loop {
+        let v = s.call("evk", Command::Events { cursor }).unwrap();
+        let Some(e) = v["events"].as_array().and_then(|e| e.first().cloned()) else {
+            return false;
+        };
+        cursor = e["cursor"].as_u64().unwrap();
+        if e["run"] == run && e["event"]["kind"] == kind {
+            return true;
+        }
+    }
+}
+#[test]
+fn crashed_guardian_unknown_identity_is_released_by_human_attestation() {
+    let s = Service::new();
+    let repo = repo();
+    agentpm::git::GitService::open(repo.path())
+        .unwrap()
+        .allocate("crashed", "m", "test-crashed", "HEAD")
+        .unwrap();
+    s.call(
+        "one",
+        Command::Policy {
+            slots: 1,
+            project_cap: 1,
+        },
+    )
+    .unwrap();
+    s.call(
+        "crashed",
+        bound(
+            &s,
+            repo.path(),
+            "crashed",
+            r#"[{"kind":"delay","milliseconds":600000},{"kind":"success"}]"#,
+            600000,
+        ),
+    )
+    .unwrap();
+    wait(|| worker_started(&s, "crashed").then_some(()));
+    // The guardian dies without a receipt; its orphaned worker is killed by hand.
+    let pid = s
+        .call(
+            "p",
+            Command::Show {
+                run: "crashed".into(),
+            },
+        )
+        .unwrap()["pid"]
+        .as_i64()
+        .unwrap();
+    let _ = Process::new("pkill")
+        .args(["-KILL", "-P", &pid.to_string()])
+        .status();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    wait(|| (controls(&s, "c", "crashed")["identity_unknown"] == true).then_some(()));
+    // Frozen: slot held, cleanup refused, refusals name the command.
+    assert!(
+        s.call(
+            "blocked",
+            Command::Start {
+                script: s.script("n.json", r#"[{"kind":"success"}]"#)
+            }
+        )
+        .is_err()
+    );
+    assert!(!cli_cleanup(repo.path(), "crashed").status.success());
+    let e = s
+        .call(
+            "tk",
+            Command::Takeover {
+                run: "crashed".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(e.contains(CONFIRM), "{e}");
+    confirm(&s, "attest", "crashed").unwrap();
+    assert!(cli_cleanup(repo.path(), "crashed").status.success());
+    s.call(
+        "next",
+        Command::Start {
+            script: s.script("n2.json", r#"[{"kind":"success"}]"#),
+        },
+    )
+    .unwrap();
+    terminal(&s, "next");
+    s.call(
+        "ext",
+        Command::Extend {
+            run: "crashed".into(),
+            additional_ms: 1000,
+        },
+    )
+    .unwrap();
+}
+#[test]
+fn exhausted_state_gets_one_consistent_message_naming_the_next_command() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    {
+        let db = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.execute_batch(include_str!("../src/schema.sql")).unwrap();
+        db.execute_batch(include_str!("../src/supervisor-schema.sql"))
+            .unwrap();
+        db.execute_batch("ALTER TABLE fake_runs ADD COLUMN script_bytes BLOB; PRAGMA user_version=3;
+          INSERT INTO fake_runs(id,state,result,operation,session,cwd,executable,created_at) VALUES('done','finished','ok','done','done','/','/fake','then');").unwrap();
+    }
+    let s = Service::in_dir(dir);
+    let resume = s
+        .call("r", Command::Resume { run: "done".into() })
+        .unwrap_err();
+    let repair = s
+        .call("p", Command::Repair { run: "done".into() })
+        .unwrap_err();
+    assert_eq!(resume, repair);
+    assert!(
+        resume.contains("budget exhausted") && resume.contains("run extend done"),
+        "{resume}"
+    );
 }

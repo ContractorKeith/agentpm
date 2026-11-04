@@ -58,8 +58,11 @@ enum RunCommand {
     Show {
         run: String,
     },
+    /// Show a run's controls; with --confirm-ended, attest that its unknown execution has ended.
     Reconcile {
         run: String,
+        #[arg(long)]
+        confirm_ended: bool,
         #[arg(long)]
         command_id: String,
     },
@@ -295,8 +298,20 @@ fn run() -> Result<bool, String> {
                         },
                 } => (command_id, ServiceCommand::ProjectCap { project, cap }),
                 Commands::Run {
-                    command: RunCommand::Reconcile { run, command_id },
-                } => (command_id, ServiceCommand::Reconcile { run }),
+                    command:
+                        RunCommand::Reconcile {
+                            run,
+                            confirm_ended,
+                            command_id,
+                        },
+                } => (
+                    command_id,
+                    if confirm_ended {
+                        ServiceCommand::ConfirmEnded { run }
+                    } else {
+                        ServiceCommand::Reconcile { run }
+                    },
+                ),
                 Commands::Run {
                     command: RunCommand::Controls { run },
                 } => ("controls".into(), ServiceCommand::Controls { run }),
