@@ -474,6 +474,33 @@ mod tests {
         );
     }
     #[test]
+    fn guardian_owner_setup_failure_records_uncertain_ownership_and_still_reaps() {
+        use std::os::unix::process::CommandExt;
+        // Missing stdout on a live child: the guardian owner must not kill a separate
+        // worker group, but must report uncertainty and reap the child it holds.
+        let child = Command::new("/bin/sleep")
+            .arg("1")
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let err = finish_guard(child, &[], Duration::from_secs(1), || false).unwrap_err();
+        assert!(err.contains("identity uncertain"), "{err}");
+        let start = Instant::now();
+        loop {
+            let rc = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if rc == -1 {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "child never reaped"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
     fn exit_is_observed_without_releasing_identity_until_group_cleanup() {
         use std::os::unix::process::CommandExt;
         let child = Command::new("/bin/sh")
