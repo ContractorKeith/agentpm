@@ -257,7 +257,14 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             if !unknown { return Err(format!("run '{run}' has no unknown execution identity; use `agentpm run cancel {run} --command-id <ID>` to stop a known execution")); }
             if let Some(repo) = &repo { crate::git::GitService::open(Path::new(repo))?.attach(&conn)?; }
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
-            let released: Vec<String> = tx.prepare("SELECT token FROM execution_identities WHERE run=?1 AND state!='finished'").map_err(error)?.query_map([&run],|r|r.get(0)).map_err(error)?.collect::<rusqlite::Result<_>>().map_err(error)?;
+            let mut released: Vec<String> = tx.prepare("SELECT token FROM execution_identities WHERE run=?1 AND state!='finished'").map_err(error)?.query_map([&run],|r|r.get(0)).map_err(error)?.collect::<rusqlite::Result<_>>().map_err(error)?;
+            let (session, cwd): (String, String) = tx.query_row("SELECT session,cwd FROM fake_runs WHERE id=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
+            // Pre-upgrade runs have no identity rows; the human vouches for the recorded session.
+            if !released.contains(&session) { released.push(session); }
+            // An attestation is a claim, not proof: refuse while a matching process is alive.
+            // Only a bound run's cwd is its worktree; an unbound cwd is the supervisor's.
+            let live = crate::process::live_executions(&released, repo.as_ref().map(|_| Path::new(&cwd)))?;
+            if !live.is_empty() { return Err(format!("run '{run}' still has a live execution: {}; stop it, then rerun `agentpm run reconcile {run} --confirm-ended --command-id <ID>`", live.join(", "))); }
             tx.execute("UPDATE execution_identities SET state='finished' WHERE run=?1 AND state!='finished'",[&run]).map_err(error)?;
             // Conservative accounting: the allowance stays consumed and dispatch stopped until extended.
             tx.execute("UPDATE execution_controls SET uncertain=0,stop=1,used_ms=max(used_ms,allowance_ms) WHERE run=?1",[&run]).map_err(error)?;

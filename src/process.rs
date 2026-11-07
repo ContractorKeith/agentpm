@@ -409,6 +409,99 @@ pub fn launch_guard(
     command.spawn().map_err(|e| e.to_string())
 }
 
+/// Live processes carrying one of `tokens` as their execution ID, or working inside
+/// `worktree`. A match proves the execution has not ended; no match proves nothing.
+/// Fails closed when the process table cannot be read.
+pub fn live_executions(tokens: &[String], worktree: Option<&Path>) -> Result<Vec<String>, String> {
+    let worktree = worktree.and_then(|p| p.canonicalize().ok());
+    let needles: Vec<String> = tokens
+        .iter()
+        .map(|t| format!("AGENTPM_EXECUTION_ID={t}"))
+        .collect();
+    let mut found = Vec::new();
+    for (pid, name, env, cwd) in processes()? {
+        if pid == std::process::id() {
+            continue;
+        }
+        let token = needles.iter().any(|n| env.iter().any(|e| e == n));
+        let inside = matches!((&worktree, &cwd), (Some(w), Some(c)) if c.starts_with(w));
+        if token || inside {
+            let why = match (token, inside) {
+                (true, true) => "execution ID and worktree cwd",
+                (true, false) => "execution ID",
+                _ => "worktree cwd",
+            };
+            found.push(format!("pid {pid} ({name}; matched {why})"));
+        }
+    }
+    Ok(found)
+}
+type Proc = (u32, String, Vec<String>, Option<std::path::PathBuf>);
+#[cfg(target_os = "linux")]
+fn processes() -> Result<Vec<Proc>, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("read process table: {e}"))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let base = entry.path();
+        // Exited or other-user processes are unreadable; they cannot be our worker.
+        let Ok(environ) = std::fs::read(base.join("environ")) else {
+            continue;
+        };
+        let env = environ
+            .split(|b| *b == 0)
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect();
+        let name = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
+        let cwd = std::fs::read_link(base.join("cwd")).ok();
+        out.push((pid, name.trim().to_owned(), env, cwd));
+    }
+    Ok(out)
+}
+#[cfg(target_os = "macos")]
+fn processes() -> Result<Vec<Proc>, String> {
+    use std::collections::HashMap;
+    let run = |cmd: &mut Command| -> Result<String, String> {
+        let o = cmd
+            .output()
+            .map_err(|e| format!("read process table: {e}"))?;
+        if !o.status.success() {
+            return Err(format!(
+                "read process table: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    // `lsof -Fpn -d cwd` prints p<pid> then n<path> for every readable process.
+    let mut cwds = HashMap::new();
+    let mut pid = None;
+    for line in run(Command::new("lsof").args(["-w", "-Fpn", "-d", "cwd"]))
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse::<u32>().ok();
+        } else if let (Some(p), Some(n)) = (pid, line.strip_prefix('n')) {
+            cwds.insert(p, std::path::PathBuf::from(n));
+        }
+    }
+    // `ps -E` appends the environment of the caller's own processes to the command.
+    let mut out = Vec::new();
+    for line in run(Command::new("ps").args(["-axwwE", "-o", "pid=,comm=,command="]))?.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|p| p.parse().ok()) else {
+            continue;
+        };
+        let name = parts.next().unwrap_or_default().to_owned();
+        let env = parts.map(str::to_owned).collect();
+        out.push((pid, name, env, cwds.remove(&pid)));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

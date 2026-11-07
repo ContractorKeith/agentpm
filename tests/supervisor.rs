@@ -1765,3 +1765,63 @@ fn exhausted_state_gets_one_consistent_message_naming_the_next_command() {
         "{resume}"
     );
 }
+#[test]
+fn attestation_refuses_while_an_orphaned_worker_is_alive() {
+    let s = Service::new();
+    let repo = repo();
+    agentpm::git::GitService::open(repo.path())
+        .unwrap()
+        .allocate("orphan", "m", "test-orphan", "HEAD")
+        .unwrap();
+    s.call(
+        "orphan",
+        bound(
+            &s,
+            repo.path(),
+            "orphan",
+            r#"[{"kind":"delay","milliseconds":600000},{"kind":"success"}]"#,
+            600000,
+        ),
+    )
+    .unwrap();
+    wait(|| worker_started(&s, "orphan").then_some(()));
+    let guardian = s
+        .call(
+            "p",
+            Command::Show {
+                run: "orphan".into(),
+            },
+        )
+        .unwrap()["pid"]
+        .as_i64()
+        .unwrap();
+    let out = Process::new("pgrep")
+        .args(["-P", &guardian.to_string()])
+        .output()
+        .unwrap();
+    let worker: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    // Only the guardian dies; its worker is orphaned and keeps running in the worktree.
+    unsafe { libc::kill(guardian as i32, libc::SIGKILL) };
+    wait(|| (controls(&s, "c", "orphan")["identity_unknown"] == true).then_some(()));
+    assert_eq!(unsafe { libc::kill(worker, 0) }, 0);
+    let e = confirm(&s, "attest", "orphan").unwrap_err();
+    assert!(e.contains(&worker.to_string()), "{e}");
+    // Nothing was released: still unknown, still frozen, no second worker possible.
+    assert_eq!(controls(&s, "c2", "orphan")["identity_unknown"], true);
+    assert!(!cli_cleanup(repo.path(), "orphan").status.success());
+    assert!(
+        s.call(
+            "res",
+            Command::Resume {
+                run: "orphan".into()
+            }
+        )
+        .is_err()
+    );
+    // Once the human actually stops it, the same attestation succeeds.
+    unsafe { libc::kill(worker, libc::SIGKILL) };
+    wait(|| (unsafe { libc::kill(worker, 0) } != 0).then_some(()));
+    let done = confirm(&s, "attest-2", "orphan").unwrap();
+    assert_eq!(done["identity_unknown"], false);
+    assert!(cli_cleanup(repo.path(), "orphan").status.success());
+}
