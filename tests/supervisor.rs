@@ -210,18 +210,21 @@ fn mismatch_lock_and_diagnostics() {
         }));
     }
 }
-fn launch_retry<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    for _ in 0..50 {
-        match f() {
-            Err(e) if e.contains("Text file busy") => std::thread::sleep(Duration::from_millis(20)),
-            other => return other,
-        }
-    }
-    f()
-}
 fn executable(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    use std::io::Write;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
 }
 #[test]
 fn excessive_stderr_and_stdout_are_drained_and_bounded() {
@@ -231,10 +234,8 @@ fn excessive_stderr_and_stdout_are_drained_and_bounded() {
         &exe,
         "#!/bin/sh\ni=0; while [ $i -lt 30000 ]; do echo diagnostic-line >&2; i=$((i+1)); done\necho '{\"protocol_version\":1,\"action\":{\"kind\":\"success\"}}'\n",
     );
-    let result = agentpm::process::finish(
-        launch_retry(|| agentpm::process::launch(&exe, "unused")).unwrap(),
-    )
-    .unwrap();
+    let result =
+        agentpm::process::finish(agentpm::process::launch(&exe, "unused").unwrap()).unwrap();
     assert!(result.contains("succeeded"));
     assert!(result.contains("truncated"));
     assert!(result.len() < 70000);
@@ -243,11 +244,9 @@ fn excessive_stderr_and_stdout_are_drained_and_bounded() {
         "#!/bin/sh\ni=0; while [ $i -lt 30000 ]; do echo excessive-output; i=$((i+1)); done\n",
     );
     assert!(
-        agentpm::process::finish(
-            launch_retry(|| agentpm::process::launch(&exe, "unused")).unwrap()
-        )
-        .unwrap_err()
-        .contains("exceeds")
+        agentpm::process::finish(agentpm::process::launch(&exe, "unused").unwrap())
+            .unwrap_err()
+            .contains("exceeds")
     );
 }
 #[test]
@@ -818,7 +817,7 @@ fn blocked_input_and_escaped_pipe_holders_cannot_extend_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("no-input");
     executable(&exe, "#!/bin/sh\ntrap '' TERM\nsleep 10\n");
-    let child = launch_retry(|| agentpm::process::launch_session(&exe, "-", "no-input")).unwrap();
+    let child = agentpm::process::launch_session(&exe, "-", "no-input").unwrap();
     let start = Instant::now();
     assert!(
         agentpm::process::finish_controlled(

@@ -46,7 +46,6 @@ fn active_work_can_be_canceled_without_delivery_evidence() {
 #[cfg(unix)]
 #[test]
 fn reported_outcome_must_match_exact_exit_code() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let executable = dir.path().join("fake");
     let request = Request {
@@ -70,16 +69,8 @@ fn reported_outcome_must_match_exact_exit_code() {
             let script = format!(
                 "#!/bin/sh\nprintf '%s\\n' '{{\"protocol_version\":1,\"action\":{action}}}'\n{ending}\n"
             );
-            std::fs::write(&executable, script).unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let mut result = agentpm::harness::execute(&request, &executable);
-            for _ in 0..50 {
-                if !format!("{result:?}").contains("Text file busy") {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                result = agentpm::harness::execute(&request, &executable);
-            }
+            write_executable(&executable, &script);
+            let result = agentpm::harness::execute(&request, &executable);
             assert_eq!(
                 result.is_ok(),
                 code == Some(expected),
@@ -357,4 +348,20 @@ fn failed_migration_rolls_back_earlier_ddl() {
             .unwrap(),
         0
     );
+}
+fn write_executable(path: &std::path::Path, text: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
 }

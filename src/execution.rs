@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params};
 use serde_json::{Value, json};
 
 pub fn migrate(db: &Connection) -> rusqlite::Result<()> {
@@ -128,7 +128,7 @@ pub fn tick_at(db: &Connection, run: &str, stamp: Stamp<'_>) -> Result<bool, Str
     .map_err(|e| e.to_string())
 }
 pub fn reserve_at(
-    db: &Connection,
+    db: &Transaction<'_>,
     run: &str,
     project: &str,
     token: &str,
@@ -162,7 +162,7 @@ pub fn reserve_at(
     Ok(())
 }
 pub fn transition_at(
-    db: &Connection,
+    db: &Transaction<'_>,
     token: &str,
     state: &str,
     stamp: Stamp<'_>,
@@ -225,7 +225,7 @@ pub fn checkpoint(db: &Connection, run: &str, _elapsed_ms: u64) -> Result<bool, 
     tick_at(db, run, now())
 }
 pub fn finish_known(
-    db: &Connection,
+    db: &Transaction<'_>,
     token: &str,
     elapsed_ms: u64,
     now: Stamp<'_>,

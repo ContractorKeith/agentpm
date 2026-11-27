@@ -381,7 +381,7 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
     }
 }
 fn register_attempt(
-    db: &Connection,
+    db: &rusqlite::Transaction<'_>,
     run: &str,
     project: &str,
     token: &str,

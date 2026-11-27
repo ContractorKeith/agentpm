@@ -81,6 +81,30 @@ fn identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
+struct ClaimLock(Connection);
+impl ClaimLock {
+    fn commit(self) -> Result<()> {
+        self.0.execute_batch("COMMIT").map_err(|e| e.to_string())
+    }
+    fn commit_and_reacquire(&self) -> Result<()> {
+        self.0
+            .execute_batch("COMMIT; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())
+    }
+}
+impl std::ops::Deref for ClaimLock {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+impl Drop for ClaimLock {
+    fn drop(&mut self) {
+        if !self.0.is_autocommit() {
+            let _ = self.0.execute_batch("ROLLBACK");
+        }
+    }
+}
 pub struct GitService {
     common: PathBuf,
 }
@@ -98,7 +122,7 @@ impl GitService {
     fn command(&self, args: &[&str]) -> Result<String> {
         git(&self.common, args)
     }
-    fn connection(&self) -> Result<Connection> {
+    fn connection(&self) -> Result<ClaimLock> {
         let db = Connection::open(self.common.join("agentpm-claims.sqlite3"))
             .map_err(|e| e.to_string())?;
         db.busy_timeout(Duration::from_secs(10))
@@ -109,7 +133,7 @@ impl GitService {
         CREATE TABLE IF NOT EXISTS handback_operations(operation TEXT PRIMARY KEY,run TEXT NOT NULL,milestone TEXT NOT NULL,report TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0);").map_err(|e|e.to_string())?;
         db.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
-        Ok(db)
+        Ok(ClaimLock(db))
     }
     fn read(&self, db: &Connection, run: &str, milestone: &str) -> Result<Option<Allocation>> {
         db.query_row(
@@ -278,8 +302,7 @@ impl GitService {
             )
             .map_err(|e| e.to_string())?;
         }
-        db.execute_batch("COMMIT; BEGIN IMMEDIATE")
-            .map_err(|e| e.to_string())?;
+        db.commit_and_reacquire()?;
         let mut a = self
             .read(&db, run, milestone)?
             .ok_or("allocation disappeared")?;
@@ -324,7 +347,7 @@ impl GitService {
             params![run, milestone],
         )
         .map_err(|e| e.to_string())?;
-        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        db.commit()?;
         a.state = "allocated".into();
         Ok(a)
     }
@@ -449,7 +472,7 @@ impl GitService {
             params![run, milestone],
         )
         .map_err(|e| e.to_string())?;
-        db.execute_batch("COMMIT").map_err(|e| e.to_string())
+        db.commit()
     }
     pub fn prepare_handback(
         &self,
@@ -494,7 +517,7 @@ impl GitService {
             params![operation, run, milestone, report.to_string()],
         )
         .map_err(|e| e.to_string())?;
-        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        db.commit()?;
         Ok(report)
     }
     pub fn complete_handback(
@@ -531,7 +554,7 @@ impl GitService {
             )
             .map_err(|e| e.to_string())?;
         }
-        db.execute_batch("COMMIT").map_err(|e| e.to_string())
+        db.commit()
     }
     pub fn inspect(&self, run: &str, milestone: &str) -> Result<Allocation> {
         let db = self.connection()?;
@@ -557,7 +580,7 @@ impl GitService {
                 params![run, milestone],
             )
             .map_err(|e| e.to_string())?;
-            db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+            db.commit()?;
             a.state = "cleaned".into();
             return Ok(a);
         }
@@ -576,8 +599,7 @@ impl GitService {
             params![run, milestone],
         )
         .map_err(|e| e.to_string())?;
-        db.execute_batch("COMMIT; BEGIN IMMEDIATE")
-            .map_err(|e| e.to_string())?;
+        db.commit_and_reacquire()?;
         if a.path.exists() {
             self.owned(&a)?;
             self.checkout_matches(&a)?;
@@ -605,7 +627,7 @@ impl GitService {
             params![run, milestone],
         )
         .map_err(|e| e.to_string())?;
-        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        db.commit()?;
         a.state = "cleaned".into();
         Ok(a)
     }
