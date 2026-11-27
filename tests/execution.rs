@@ -16,7 +16,7 @@ fn stamp(ms: i64) -> Stamp<'static> {
 }
 fn apply(
     db: &mut Connection,
-    f: impl FnOnce(&Connection) -> Result<(), String>,
+    f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let tx = db.transaction().unwrap();
     f(&tx)?;
