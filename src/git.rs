@@ -1,4 +1,3 @@
-//! Durable, repository-local milestone claims. All Git arguments bypass a shell.
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::{
@@ -10,8 +9,6 @@ use std::{
 
 type Result<T> = std::result::Result<T, String>;
 
-// Hooks and tools can export Git's repository/index/config selectors. Our explicit
-// repository must own every operation, including update-ref's separate launcher.
 fn git_command() -> Command {
     let mut command = Command::new("git");
     for (name, _) in std::env::vars_os() {
@@ -51,7 +48,6 @@ where
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
-/// Resolve a worktree's HEAD with a diagnosis instead of raw git stderr.
 fn worktree_head(a: &Allocation) -> Result<String> {
     git(&a.path, ["rev-parse", "--verify", "-q", "HEAD"]).map_err(|_| {
         format!(
@@ -62,7 +58,6 @@ fn worktree_head(a: &Allocation) -> Result<String> {
         )
     })
 }
-/// Resolve the branch a worktree is on; a detached HEAD is reported, not leaked.
 fn worktree_branch(a: &Allocation) -> Result<String> {
     git(&a.path, ["symbolic-ref", "-q", "HEAD"]).map_err(|_| {
         format!(
@@ -86,8 +81,6 @@ fn identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open by any checkout or symlink. The Git common directory is the identity
-/// and claim namespace, independent of caller-supplied data directories.
 pub struct GitService {
     common: PathBuf,
 }
@@ -114,11 +107,8 @@ impl GitService {
         db.execute_batch("CREATE TABLE IF NOT EXISTS human_ownership(run TEXT NOT NULL, milestone TEXT NOT NULL, PRIMARY KEY(run,milestone));").map_err(|e|e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS execution_reservations(run TEXT NOT NULL, milestone TEXT NOT NULL, token TEXT NOT NULL UNIQUE, PRIMARY KEY(run,milestone));
         CREATE TABLE IF NOT EXISTS handback_operations(operation TEXT PRIMARY KEY,run TEXT NOT NULL,milestone TEXT NOT NULL,report TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0);").map_err(|e|e.to_string())?;
-        // BEGIN IMMEDIATE is held across external effects; persisted intents survive
-        // crashes, while all cooperating CLI/supervisor instances serialize here.
         db.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
-        // Connection owns the lock until drop; writes below use explicit commits.
         Ok(db)
     }
     fn read(&self, db: &Connection, run: &str, milestone: &str) -> Result<Option<Allocation>> {
@@ -153,8 +143,6 @@ impl GitService {
         }
         Ok(())
     }
-    // Git's ref transaction couples branch creation/deletion to the ownership
-    // marker. A crash cannot leave an indistinguishable unowned branch.
     fn refs(&self, script: &str) -> Result<()> {
         use std::io::Write;
         let mut child = git_command()
@@ -204,7 +192,6 @@ impl GitService {
         {
             return Err("worktree identity or branch changed; refusing mutation".into());
         }
-        // Verify the Git administration entry points back to this exact checkout.
         let backlink = std::fs::read_to_string(gitdir.join("gitdir")).map_err(|e| e.to_string())?;
         if PathBuf::from(backlink.trim())
             .canonicalize()
@@ -219,7 +206,6 @@ impl GitService {
         Ok(())
     }
     fn unchanged_checkout(&self, a: &Allocation) -> Result<()> {
-        // Status and non-force removal both trust these flags and can miss edits.
         let entries = git(&a.path, ["ls-files", "-v", "-z"])?;
         if entries
             .split('\0')
@@ -292,8 +278,6 @@ impl GitService {
             )
             .map_err(|e| e.to_string())?;
         }
-        // Commit intent before effects, then reacquire serialization. The durable
-        // unique row protects the claim during this short lock handoff.
         db.execute_batch("COMMIT; BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
         let mut a = self
@@ -367,7 +351,6 @@ impl GitService {
         }
         Ok(())
     }
-    /// Cooperating callers share the same immediate transaction as cleanup.
     pub fn execution_checkout(&self, run: &str, milestone: &str) -> Result<Allocation> {
         let db = self.connection()?;
         Self::not_human(&db, run, milestone)?;
@@ -392,7 +375,6 @@ impl GitService {
         }
         Ok(())
     }
-    /// Attach the canonical claim store for SQLite's atomic multi-file commit.
     pub fn attach(&self, db: &Connection) -> Result<()> {
         drop(self.connection()?);
         let names = db
@@ -501,7 +483,6 @@ impl GitService {
                 "--ignored",
             ],
         )?;
-        // Inspection never adopts edits as the expected revision or clean evidence.
         let report = serde_json::json!({"head":head,"branch":branch,"edits":edits,"evidence_valid":false,"requires_revalidation":true});
         db.execute(
             "INSERT OR REPLACE INTO handback_reports VALUES(?1,?2,?3)",
@@ -516,7 +497,6 @@ impl GitService {
         db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(report)
     }
-    /// Called only after the supervisor's durable handback receipt is present.
     pub fn complete_handback(
         &self,
         operation: &str,
@@ -581,8 +561,6 @@ impl GitService {
             a.state = "cleaned".into();
             return Ok(a);
         }
-        // Persist cleanup intent before removal so a crash after worktree removal
-        // can finish ref cleanup without guessing ownership from an absent path.
         self.owned(&a)?;
         if a.path.exists() {
             self.checkout_matches(&a)?;

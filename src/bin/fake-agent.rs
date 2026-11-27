@@ -41,7 +41,6 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
     Ok(true)
 }
-// Adversarial process fixture: fork only after exec has closed spawn's error pipe.
 fn escaped_pipe_fixture(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut pipe = [0; 2];
     if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {

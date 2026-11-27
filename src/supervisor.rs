@@ -1,4 +1,3 @@
-//! Sole-writer local fake-run command service, separate from the M0 demo.
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -82,7 +81,6 @@ pub enum Command {
     Reconcile {
         run: String,
     },
-    /// Human attestation that an unknown execution has ended; releases its slot and reservation.
     ConfirmEnded {
         run: String,
     },
@@ -96,7 +94,6 @@ fn open(dir: &Path) -> Result<Connection, String> {
     crate::store::migrate(&mut db).map_err(error)?;
     Ok(db)
 }
-/// The supported human path out of an unknown execution identity.
 fn confirm_hint(run: &str) -> String {
     format!(
         "after verifying the execution has ended, attest it with `agentpm run reconcile {run} --confirm-ended --command-id <ID>`"
@@ -228,7 +225,6 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             if !handback {
                 service.takeover(&run,&milestone)?;
                 conn.execute("UPDATE execution_controls SET stop=1 WHERE run=?1",[&run]).map_err(error)?;
-                // Release the store lock while the owner performs bounded shutdown.
                 drop(conn);
                 let deadline = Instant::now()+Duration::from_secs(2);
                 loop {
@@ -259,14 +255,10 @@ fn handle(db: Arc<Mutex<Connection>>, request: Request, exe: PathBuf) -> Result<
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(error)?;
             let mut released: Vec<String> = tx.prepare("SELECT token FROM execution_identities WHERE run=?1 AND state!='finished'").map_err(error)?.query_map([&run],|r|r.get(0)).map_err(error)?.collect::<rusqlite::Result<_>>().map_err(error)?;
             let (session, cwd): (String, String) = tx.query_row("SELECT session,cwd FROM fake_runs WHERE id=?1",[&run],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
-            // Pre-upgrade runs have no identity rows; the human vouches for the recorded session.
             if !released.contains(&session) { released.push(session); }
-            // An attestation is a claim, not proof: refuse while a matching process is alive.
-            // Only a bound run's cwd is its worktree; an unbound cwd is the supervisor's.
             let live = crate::process::live_executions(&released, repo.as_ref().map(|_| Path::new(&cwd)))?;
             if !live.is_empty() { return Err(format!("run '{run}' still has a live execution: {}; stop it, then rerun `agentpm run reconcile {run} --confirm-ended --command-id <ID>`", live.join(", "))); }
             tx.execute("UPDATE execution_identities SET state='finished' WHERE run=?1 AND state!='finished'",[&run]).map_err(error)?;
-            // Conservative accounting: the allowance stays consumed and dispatch stopped until extended.
             tx.execute("UPDATE execution_controls SET uncertain=0,stop=1,used_ms=max(used_ms,allowance_ms) WHERE run=?1",[&run]).map_err(error)?;
             tx.execute("UPDATE fake_runs SET state='failed',result='execution ended; confirmed by human attestation' WHERE id=?1 AND state IN ('queued','running')",[&run]).map_err(error)?;
             if repo.is_some() { tx.execute("DELETE FROM repo_claims.execution_reservations WHERE run=?1",[&run]).map_err(error)?; }
@@ -416,7 +408,6 @@ fn register_attempt(
     .map_err(error)?;
     Ok(())
 }
-/// Durable, deduplicated diagnostic for a run whose reconciliation could not proceed.
 fn attention(db: &Connection, run: &str, reason: &str) {
     let payload = json!({"kind":"reconciliation_attention","reason":reason}).to_string();
     let last: Option<String> = db
@@ -433,8 +424,6 @@ fn attention(db: &Connection, run: &str, reason: &str) {
         );
     }
 }
-/// Each run is recovered on its own: an unavailable repository keeps that run's
-/// reservation and is retried on the next call, never failing unrelated work.
 fn recover_reservations(conn: &mut Connection) -> Result<(), String> {
     let rows=conn.prepare("SELECT f.id,f.session,c.repository,c.milestone FROM fake_runs f JOIN execution_controls c ON c.run=f.id WHERE f.state IN ('queued','running') AND c.repository IS NOT NULL AND c.milestone IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
     for (run, token, repo, milestone) in rows {
@@ -466,8 +455,6 @@ fn handback_operation(db: &Connection, request: &str) -> Result<String, String> 
         Sha256::digest(serde_json::to_vec(&(path, request)).map_err(error)?)
     ))
 }
-/// Returns each pending request that could not complete, with its cause; the caller
-/// decides whether a failure concerns the command in hand.
 fn reconcile_handbacks(db: &Connection) -> Result<Vec<(String, String)>, String> {
     let rows = db
         .prepare("SELECT h.request_id,h.operation,h.repository,coalesce(json_extract(q.command,'$.run'),'') FROM handback_transfers h JOIN supervisor_requests q ON q.id=h.request_id WHERE h.pending=1")
@@ -495,7 +482,6 @@ fn reconcile_handbacks(db: &Connection) -> Result<Vec<(String, String)>, String>
             .map_err(error)?;
             Ok(())
         };
-        // The pending row (and the repository's freeze) persists for the next retry.
         if let Err(e) = done() {
             attention(db, &run, &format!("handback completion pending: {e}"));
             failed.push((request, e));
@@ -503,9 +489,6 @@ fn reconcile_handbacks(db: &Connection) -> Result<Vec<(String, String)>, String>
     }
     Ok(failed)
 }
-/// Receipts are guardian-owned, nonce/hash-bound, and only published after cleanup.
-/// A run whose receipt cannot be applied (e.g. unavailable repository) is skipped and
-/// retried; its token is returned so recovery does not classify it as unknown.
 fn reconcile(conn: &mut Connection) -> Result<Vec<String>, String> {
     let rows=conn.prepare("SELECT i.token,i.run,i.receipt_path,i.snapshot_hash,i.baseline_ms,c.repository FROM execution_identities i JOIN execution_controls c ON c.run=i.run WHERE i.state!='finished' AND i.receipt_path IS NOT NULL").map_err(error)?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?))).map_err(error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(error)?;
     let (mut deferred, mut settled, mut blocked) = (Vec::new(), Vec::new(), Vec::new());
@@ -530,7 +513,6 @@ fn reconcile(conn: &mut Connection) -> Result<Vec<String>, String> {
             settled.push(run);
         }
     }
-    // Known intervals are applied first; only then does the union advance to now.
     settled.sort();
     settled.dedup();
     for run in settled.iter().filter(|r| !blocked.contains(r)) {
@@ -720,12 +702,10 @@ fn dispatch(db: Arc<Mutex<Connection>>, attempt: Dispatch) {
                 let _ = finish_unlaunched(&mut conn, &run, &token, &e);
             }
         }
-        // Any path without authoritative completion remains reserved/uncertain.
         if let Ok(mut conn) = db.lock() {
             let deferred = reconcile(&mut conn).unwrap_or_default();
             if let Ok(tx) = conn.transaction() {
                 let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_identities WHERE token=?1 AND state!='finished')",[&token],|r|r.get(0)).unwrap_or(true);
-                // A complete receipt awaiting its repository is known, not unknown.
                 if pending && !deferred.contains(&token) {
                     let _ = crate::execution::transition_at(
                         &tx,
@@ -767,7 +747,6 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
 }
 fn read(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    // Read bounded chunks without buffering past this single frame.
     let mut buf = [0; 4096];
     loop {
         stream
@@ -844,7 +823,6 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err("supervisor already running (single-instance lock held)".into());
     }
-    // All service-created files are private, including SQLite journals.
     unsafe {
         libc::umask(0o077);
     }
@@ -866,7 +844,6 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(error)?
         .with_file_name("fake-agent");
-    // Bounded synchronous client handling; child execution uses separate threads.
     for stream in listener.incoming() {
         let mut stream = stream.map_err(error)?;
         let result = read(&mut stream, Instant::now() + Duration::from_secs(2))

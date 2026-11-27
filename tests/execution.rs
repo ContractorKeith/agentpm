@@ -58,7 +58,6 @@ fn durable_identity_union_excludes_waits_and_counts_coordinator_once() {
         ))
         .is_err()
     );
-    // Three workers plus a coordinator fit; the fourth worker does not.
     reserve(&mut db, "w3", "worker", 20);
     assert!(
         apply(&mut db, |tx| execution::reserve_at(
@@ -281,7 +280,6 @@ fn known_completion_intervals_count_overlap_once_and_exclude_idle() {
     state(&mut db, "w1", "active", 0);
     reserve(&mut db, "w2", "worker", 100);
     state(&mut db, "w2", "active", 100);
-    // Receipts are consumed long after both ended: [0,200] and [100,400] overlap.
     let late = Stamp {
         epoch: "first",
         ms: 3000,
@@ -304,7 +302,6 @@ fn known_completion_intervals_count_overlap_once_and_exclude_idle() {
         used, 400,
         "union of known intervals, no post-completion idle"
     );
-    // A later, disjoint interval adds only its own length.
     reserve(&mut db, "w3", "worker", 3000);
     state(&mut db, "w3", "active", 3000);
     apply(&mut db, |tx| {
@@ -342,7 +339,6 @@ fn known_completion_after_restart_preserves_recorded_maximum() {
         [],
     )
     .unwrap();
-    // New process epoch: the old start stamp is not comparable, so charge nothing extra.
     let next = Stamp {
         epoch: "second",
         ms: 50,

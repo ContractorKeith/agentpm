@@ -1,4 +1,3 @@
-//! Durable execution identities, admission and shared per-run active-union budgets.
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
@@ -23,8 +22,6 @@ pub fn migrate(db: &Connection) -> rusqlite::Result<()> {
       INSERT OR IGNORE INTO execution_controls(run,project,allowance_ms,used_ms,stop,uncertain)
       SELECT id,'default',7200000,7200000,1,0 FROM fake_runs WHERE state NOT IN ('queued','running');")
 }
-/// `deferred` are identities with a complete guardian receipt whose repository could not
-/// be reconciled yet: they keep their slot but are not classified as unknown.
 pub fn recover(db: &Connection, deferred: &[String]) -> Result<(), String> {
     db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS deferred(token TEXT PRIMARY KEY); DELETE FROM temp.deferred;")
         .map_err(|e| e.to_string())?;
@@ -32,8 +29,6 @@ pub fn recover(db: &Connection, deferred: &[String]) -> Result<(), String> {
         db.execute("INSERT OR IGNORE INTO temp.deferred VALUES(?1)", [token])
             .map_err(|e| e.to_string())?;
     }
-    // Authoritative completions reconcile first. Classify only unresolved
-    // execution intervals; PID values and elapsed timers never prove completion.
     db.execute_batch(
         "BEGIN IMMEDIATE;
       INSERT INTO supervisor_events(run,payload)
@@ -76,7 +71,6 @@ pub fn admit(db: &Connection, project: &str) -> Result<(), String> {
     }
     Ok(())
 }
-/// Live stamps use one monotonic clock/epoch per service process; tests can supply exact stamps.
 #[derive(Clone, Copy)]
 pub struct Stamp<'a> {
     pub epoch: &'a str,
@@ -133,7 +127,6 @@ pub fn tick_at(db: &Connection, run: &str, stamp: Stamp<'_>) -> Result<bool, Str
     )
     .map_err(|e| e.to_string())
 }
-/// Caller holds the supervisor transaction; intent and identity are one commit.
 pub fn reserve_at(
     db: &Connection,
     run: &str,
@@ -231,10 +224,6 @@ pub fn recover_clock(db: &Connection, stamp: Stamp<'_>) -> Result<(), String> {
 pub fn checkpoint(db: &Connection, run: &str, _elapsed_ms: u64) -> Result<bool, String> {
     tick_at(db, run, now())
 }
-/// Finish an identity whose authoritative receipt proves how long it ran. The union is
-/// charged only up to that known end when the start was stamped on this clock; the
-/// caller ticks to `now` after every receipt of the run is applied. An unknown end
-/// (other epoch, pre-upgrade row) is charged conservatively to `now`.
 pub fn finish_known(
     db: &Connection,
     token: &str,

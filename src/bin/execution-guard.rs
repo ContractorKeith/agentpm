@@ -1,4 +1,3 @@
-//! Subordinate process owner: service death never removes the execution deadline.
 use std::{
     io::Read,
     os::fd::AsRawFd,
