@@ -1,4 +1,3 @@
-//! Guardian-owned, durable completion evidence, published only after worker ownership ends.
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 #[derive(Serialize, Deserialize)]

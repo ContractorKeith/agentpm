@@ -1,4 +1,3 @@
-//! Narrow child-process seam; no scheduling, daemon, adapters, or host effects.
 use crate::contracts::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,7 +24,6 @@ pub struct FakeMessage {
     pub action: Action,
 }
 
-// Validate the entire response before returning any protocol events to the caller.
 pub fn execute(request: &Request, fake_agent: &Path) -> Result<Vec<EventEnvelope>, String> {
     request.validate()?;
     let Command::ExerciseFake { script } = &request.command;

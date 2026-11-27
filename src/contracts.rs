@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-// Separate ID types prevent accidentally mixing durable entity identities.
 macro_rules! ids {
     ($($name:ident),+) => {$(
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -72,7 +72,6 @@ fn reported_outcome_must_match_exact_exit_code() {
             );
             std::fs::write(&executable, script).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            // Parallel tests may fork while the script is open for writing (ETXTBSY).
             let mut result = agentpm::harness::execute(&request, &executable);
             for _ in 0..50 {
                 if !format!("{result:?}").contains("Text file busy") {
@@ -286,7 +285,6 @@ fn exercise(script: &str) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("script.json");
     std::fs::write(&path, script).unwrap();
-    // Cargo builds both binaries for process integration tests.
     assert!(std::path::Path::new(env!("CARGO_BIN_EXE_fake-agent")).exists());
     Command::new(env!("CARGO_BIN_EXE_agentpm"))
         .arg("fake")

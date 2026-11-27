@@ -1,4 +1,3 @@
-//! Initial transactional migration, not a supervisor persistence implementation.
 use rusqlite::{Connection, Result};
 pub const SCHEMA_VERSION: u32 = 5;
 

@@ -1,4 +1,3 @@
-//! Owned, bounded fake process execution. Never replay an uncertain launch.
 use crate::harness::{Action, FakeMessage, MAX_BYTES};
 use std::{
     io::Read,
@@ -50,7 +49,6 @@ fn nonblocking(fd: &impl std::os::fd::AsRawFd) -> Result<(), String> {
 }
 fn collect(stream: &mut impl Read, saved: &mut Vec<u8>, overflow: &mut bool) {
     let mut buf = [0; 4096];
-    // Bound work per tick even when a producer never stops writing.
     for _ in 0..16 {
         match stream.read(&mut buf) {
             Ok(0) => break,
@@ -67,7 +65,6 @@ fn collect(stream: &mut impl Read, saved: &mut Vec<u8>, overflow: &mut bool) {
         }
     }
 }
-// WNOWAIT reserves the leader PID/PGID until all group signals are complete.
 fn exited_unreaped(child: &Child) -> Result<bool, String> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -93,8 +90,6 @@ pub fn finish(child: Child) -> Result<String, String> {
 pub fn finish_with_timeout(child: Child, timeout: Duration) -> Result<String, String> {
     finish_controlled(child, &[], timeout, || false)
 }
-/// Only a live Child whose unreaped leader reserves the group may be signaled.
-/// Pipes are nonblocking: escaped pipe holders cannot keep this owner waiting.
 pub fn finish_controlled(
     child: Child,
     input: &[u8],
@@ -159,7 +154,6 @@ pub struct OwnedResult {
     pub result: Result<String, String>,
     pub complete: bool,
 }
-/// Ownership certainty is typed, independent of untrusted protocol diagnostics.
 pub fn finish_with_grace_evidence(
     child: Child,
     input: &[u8],
@@ -178,8 +172,6 @@ pub fn finish_with_grace_evidence(
         },
     }
 }
-// Error paths retain the Child until cleanup/reap succeeds. A failed ownership
-// probe never authorizes a signal to a potentially reused numeric identity.
 fn cleanup_error(mut child: Child, reason: String, kill_worker: bool) -> ProcessError {
     if !kill_worker {
         thread::spawn(move || {
@@ -224,7 +216,6 @@ fn finish_owner(
     mut probe: impl FnMut(&Child) -> Result<bool, String>,
 ) -> Result<String, ProcessError> {
     use std::io::Write;
-    // Darwin can hide a zombie PGID even while WNOWAIT reserves its identity.
     if unsafe { libc::getpgid(child.id() as i32) } != child.id() as i32
         && !exited_unreaped(&child).unwrap_or(false)
     {
@@ -289,8 +280,6 @@ fn finish_owner(
         thread::sleep(Duration::from_millis(10));
     };
     if !exited && !kill_on_timeout {
-        // The guardian may be descheduled while holding its worker Child.
-        // Killing it here could orphan that separate group. Retain uncertainty.
         thread::spawn(move || {
             let _ = child.wait();
         });
@@ -374,7 +363,6 @@ fn finish_owner(
         .map_err(|e| ProcessError::from(format!("{e}; {diagnostics}")))
 }
 
-/// A separate guardian survives service death and retains the worker Child.
 pub fn launch_guard(
     executable: &Path,
     session: &str,
@@ -409,9 +397,6 @@ pub fn launch_guard(
     command.spawn().map_err(|e| e.to_string())
 }
 
-/// Live processes carrying one of `tokens` as their execution ID, or working inside
-/// `worktree`. A match proves the execution has not ended; no match proves nothing.
-/// Fails closed when the process table cannot be read.
 pub fn live_executions(tokens: &[String], worktree: Option<&Path>) -> Result<Vec<String>, String> {
     let worktree = worktree.and_then(|p| p.canonicalize().ok());
     let needles: Vec<String> = tokens
@@ -446,7 +431,6 @@ fn processes() -> Result<Vec<Proc>, String> {
             continue;
         };
         let base = entry.path();
-        // Exited or other-user processes are unreadable; they cannot be our worker.
         let Ok(environ) = std::fs::read(base.join("environ")) else {
             continue;
         };
@@ -475,7 +459,6 @@ fn processes() -> Result<Vec<Proc>, String> {
         }
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     };
-    // `lsof -Fpn -d cwd` prints p<pid> then n<path> for every readable process.
     let mut cwds = HashMap::new();
     let mut pid = None;
     for line in run(Command::new("lsof").args(["-w", "-Fpn", "-d", "cwd"]))
@@ -488,7 +471,6 @@ fn processes() -> Result<Vec<Proc>, String> {
             cwds.insert(p, std::path::PathBuf::from(n));
         }
     }
-    // `ps -E` appends the environment of the caller's own processes to the command.
     let mut out = Vec::new();
     for line in run(Command::new("ps").args(["-axwwE", "-o", "pid=,comm=,command="]))?.lines() {
         let mut parts = line.split_whitespace();
@@ -569,8 +551,6 @@ mod tests {
     #[test]
     fn guardian_owner_setup_failure_records_uncertain_ownership_and_still_reaps() {
         use std::os::unix::process::CommandExt;
-        // Missing stdout on a live child: the guardian owner must not kill a separate
-        // worker group, but must report uncertainty and reap the child it holds.
         let child = Command::new("/bin/sleep")
             .arg("1")
             .stderr(Stdio::piped())
@@ -603,14 +583,12 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        // This shell has no command and exits; repeated WNOWAIT must still observe it.
         let start = Instant::now();
         while !exited_unreaped(&child).unwrap() {
             assert!(start.elapsed() < Duration::from_secs(3));
             thread::sleep(Duration::from_millis(10));
         }
         assert!(exited_unreaped(&child).unwrap());
-        // finish owns the only reap, even though protocol validation fails.
         let pid = child.id();
         let result = finish_with_timeout(child, Duration::from_secs(1));
         assert!(result.is_err());

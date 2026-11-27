@@ -168,7 +168,6 @@ fn dirty_untracked_ignored_commits_and_unowned_survive() {
             std::fs::remove_file(a.path.join(name)).unwrap();
         }
     }
-    // An ignored file is data too.
     git(
         t.path(),
         &[
@@ -217,7 +216,6 @@ fn canonical_aliases_and_competing_processes_share_claims() {
     assert_eq!(winners, 1);
     let s = GitService::open(&alias).unwrap();
     assert!(s.allocate("different", "m", "shared", "HEAD").is_err());
-    // A linked checkout also resolves to the same common repository identity.
     let a = s.allocate("unique", "m", "unique", "HEAD").unwrap();
     assert!(
         GitService::open(&a.path)
@@ -262,7 +260,6 @@ fn persisted_intents_reconcile_after_external_effects() {
     let s = GitService::open(t.path()).unwrap();
     let a = s.allocate("r", "m", "recover", "HEAD").unwrap();
     let db = rusqlite::Connection::open(t.path().join(".git/agentpm-claims.sqlite3")).unwrap();
-    // Simulate restart after branch ownership transaction, before checkout add.
     git(t.path(), &["worktree", "remove", a.path.to_str().unwrap()]);
     db.execute("UPDATE allocations SET state='allocating'", [])
         .unwrap();
@@ -273,7 +270,6 @@ fn persisted_intents_reconcile_after_external_effects() {
         String::from_utf8_lossy(&recovered.stderr)
     );
     assert!(a.path.exists());
-    // Simulate restart after checkout removal, before atomic ref deletion.
     db.execute("UPDATE allocations SET state='cleaning'", [])
         .unwrap();
     git(t.path(), &["worktree", "remove", a.path.to_str().unwrap()]);
@@ -326,7 +322,6 @@ fn detached_or_unborn_worktrees_get_a_diagnosis_not_raw_git_stderr() {
     assert!(e.contains("detached") && !e.contains("fatal:"), "{e}");
     git(&a.path, &["checkout", "diag"]);
     service.execution_checkout("r", "m").unwrap();
-    // The branch disappears underneath the checkout.
     git(t.path(), &["update-ref", "-d", "refs/heads/diag"]);
     for e in [
         service.execution_checkout("r", "m").unwrap_err(),
@@ -336,7 +331,6 @@ fn detached_or_unborn_worktrees_get_a_diagnosis_not_raw_git_stderr() {
             e.contains("branch was deleted") && !e.contains("fatal:"),
             "{e}"
         );
-        // The way forward is in the message, and it works.
         assert!(
             e.contains(&format!("branch diag {}", a.expected_head)),
             "{e}"

@@ -1,4 +1,3 @@
-//! Immutable, explicitly collected context; no source discovery or dispatch authority.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,7 +15,6 @@ const MAX_FILES: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct Input {
     pub path: PathBuf,
-    /// Caller-supplied source revision (for example an issue snapshot receipt).
     pub source_revision: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,14 +28,12 @@ pub struct Role {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
-    /// Absolute collection roots, including explicit existing user skill roots.
     pub roots: Vec<PathBuf>,
     pub approved: Input,
     pub brief: Input,
     pub instructions: Vec<Input>,
     pub dependencies: Vec<Input>,
     pub roles: BTreeMap<String, Role>,
-    /// Whole-role replacements; there is no implicit provider fallback.
     pub overrides: BTreeMap<String, Role>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +87,6 @@ fn credential(path: &Path) -> bool {
     })
 }
 fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
-    // Opening a FIFO can block before descriptor metadata is available.
     if !fs::metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .is_file()
@@ -112,14 +107,11 @@ fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Parse a bounded manifest. Relative input paths are rejected, independent of cwd.
 pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
     serde_json::from_slice(&bounded_read(path, LIMIT)?).map_err(|e| e.to_string())
 }
 
-/// Read-only snapshot construction; all required inputs validate before storage.
 pub fn collect(manifest: Manifest, previous: Option<String>) -> Result<Package, String> {
-    // Library callers must obey the same metadata bound as manifest-file callers.
     if serde_json::to_vec(&manifest)
         .map_err(|e| e.to_string())?
         .len()
@@ -220,7 +212,6 @@ pub fn collect(manifest: Manifest, previous: Option<String>) -> Result<Package, 
     })
 }
 
-/// Filesystem content store, isolated from the supervisor database.
 pub struct ContextStore {
     root: PathBuf,
 }
@@ -257,7 +248,6 @@ impl ContextStore {
     pub fn create(&self, manifest: Manifest) -> Result<String, String> {
         self.save(collect(manifest, None)?)
     }
-    /// Acknowledgment pins exactly the prior content; changed source is read only here.
     pub fn update(
         &self,
         previous: &str,
@@ -291,7 +281,6 @@ impl ContextStore {
             fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))
                 .map_err(|e| e.to_string())?;
         }
-        // Stage then hard-link: readers never observe partial data; publication never overwrites.
         let mut temp = tempfile::NamedTempFile::new_in(&self.root).map_err(|e| e.to_string())?;
         temp.write_all(&bytes).map_err(|e| e.to_string())?;
         temp.as_file().sync_all().map_err(|e| e.to_string())?;

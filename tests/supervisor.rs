@@ -94,7 +94,6 @@ fn durable_detached_idempotent_replay_and_restart() {
         .unwrap_err()
         .contains("different payload")
     );
-    // Each request opens and closes a fresh socket. The child belongs to the service.
     let done = wait(|| {
         let v = s
             .call(
@@ -211,7 +210,6 @@ fn mismatch_lock_and_diagnostics() {
         }));
     }
 }
-/// Parallel tests may fork while a script is open for writing (ETXTBSY); retry the launch.
 fn launch_retry<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     for _ in 0..50 {
         match f() {
@@ -267,7 +265,6 @@ fn cli_starts_background_service_and_returns() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    // Exercise the detached service through fresh client connections.
     let script = dir.path().join("script.json");
     std::fs::write(&script, r#"[{"kind":"success"}]"#).unwrap();
     let v = client(
@@ -282,7 +279,6 @@ fn cli_starts_background_service_and_returns() {
     )
     .unwrap();
     assert_eq!(v["run"], "cli-run");
-    // Service status includes the supervisor identity for local operational tooling.
     let status = client(
         dir.path(),
         Request {
@@ -487,7 +483,6 @@ fn budgets_caps_cancellation_and_persistent_repair_lineage() {
         "long.json",
         r#"[{"kind":"delay","milliseconds":10000},{"kind":"success"}]"#,
     );
-    // Long-lived holders make the cap/global rejections independent of timing.
     s.call("hold", controlled(script.clone(), "a", 10000))
         .unwrap();
     assert!(s.call("cap", controlled(script.clone(), "a", 500)).is_err());
@@ -1053,7 +1048,6 @@ fn canonical_reservation_blocks_independent_maintenance_through_uncertain_shutdo
         .join("receipts")
         .join(format!("{}.ready", live["session"].as_str().unwrap()));
     wait(|| ready.exists().then_some(()));
-    // This live guardian's unreaped leader remains held by the running service.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
     s.call(
         "cancel-res",
@@ -1229,7 +1223,6 @@ fn guardian_completion_releases_recovered_slots_and_repository_reservation_witho
         (v["state"] == "running").then_some(v)
     });
     restart(&mut s);
-    // No timer/PID-based release: only the nonce/hash-bound guardian receipt counts.
     let db = rusqlite::Connection::open(s.dir.path().join("state.sqlite")).unwrap();
     db.execute(
         "UPDATE fake_runs SET pid=?1 WHERE id='recover-owned'",
@@ -1299,11 +1292,9 @@ fn unknown_historical_execution_keeps_capacity_and_canonical_freeze_without_pid_
         )
         .is_err()
     );
-    // The deliberately unrelated stored PID is this still-running test process.
     assert_eq!(unsafe { libc::kill(std::process::id() as i32, 0) }, 0);
 }
 
-/// True once the guardian has spawned its worker, i.e. the snapshot was delivered.
 fn worker_started(s: &Service, run: &str) -> bool {
     let v = s.call("pid", Command::Show { run: run.into() }).unwrap();
     v["state"] != "queued"
@@ -1339,7 +1330,6 @@ fn known_completion_interval_is_not_charged_as_supervisor_idle_time() {
     )
     .unwrap();
     wait(|| worker_started(&s, "fast").then_some(()));
-    // Only the supervisor stops; the guardian-owned worker completes meanwhile.
     signal(&s, libc::SIGSTOP);
     std::thread::sleep(Duration::from_millis(1500));
     signal(&s, libc::SIGCONT);
@@ -1385,7 +1375,6 @@ fn unrelated_work_proceeds(s: &Service) {
     terminal(s, "unrelated");
 }
 fn returns_and_reconciles(s: &Service, a: &Path, moved: &Path) {
-    // Unavailable repository: diagnostics work and the run is not declared unknown.
     assert_eq!(controls(s, "ca", "run-a")["identity_unknown"], false);
     std::fs::rename(moved, a).unwrap();
     let v = terminal(s, "run-a");
@@ -1406,7 +1395,6 @@ fn unavailable_repository_is_isolated_live_and_reconciles_on_return() {
     std::fs::rename(a.path(), &moved).unwrap();
     signal(&s, libc::SIGCONT);
     unrelated_work_proceeds(&s);
-    // Reservation survives: run-a still holds its slot and has not been failed.
     assert_eq!(
         s.call(
             "show-a",
@@ -1515,7 +1503,6 @@ fn runs_created_by_the_previous_schema_remain_controllable_after_upgrade() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     {
-        // The schema-3 database origin/main writes: no execution_controls rows.
         let db = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
         db.execute_batch(include_str!("../src/schema.sql")).unwrap();
         db.execute_batch(include_str!("../src/supervisor-schema.sql"))
@@ -1529,7 +1516,6 @@ fn runs_created_by_the_previous_schema_remain_controllable_after_upgrade() {
         let c = s
             .call(&format!("c-{run}"), Command::Controls { run: run.into() })
             .unwrap();
-        // Usage is unknown, never zero: the migrated allowance counts as consumed.
         assert_eq!(c["used_ms"], c["allowance_ms"], "{c}");
         assert_eq!(c["identity_unknown"], false);
         for (i, command) in every_control(run).into_iter().enumerate() {
@@ -1537,7 +1523,6 @@ fn runs_created_by_the_previous_schema_remain_controllable_after_upgrade() {
                 assert!(!e.contains("no rows"), "{run} command {i}: {e}");
             }
         }
-        // A human extension restores headroom for the migrated run.
         let before = s
             .call(&format!("b-{run}"), Command::Controls { run: run.into() })
             .unwrap()["allowance_ms"]
@@ -1565,7 +1550,6 @@ fn execution_in_flight_at_upgrade_has_a_human_path_out() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     {
-        // origin/main database with an execution still running when it was upgraded.
         let db = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
         db.execute_batch(include_str!("../src/schema.sql")).unwrap();
         db.execute_batch(include_str!("../src/supervisor-schema.sql"))
@@ -1584,7 +1568,6 @@ fn execution_in_flight_at_upgrade_has_a_human_path_out() {
     let c = controls(&s, "c0", "oldrun");
     assert_eq!(c["identity_unknown"], true);
     assert_eq!(c["project"], "historical");
-    // Every refusal names the supported command.
     for (i, command) in [
         Command::Takeover {
             run: "oldrun".into(),
@@ -1611,7 +1594,6 @@ fn execution_in_flight_at_upgrade_has_a_human_path_out() {
     }
     let done = confirm(&s, "attest", "oldrun").unwrap();
     assert_eq!(done["identity_unknown"], false);
-    // Replay is idempotent; a different payload under the same id is refused.
     assert_eq!(done, confirm(&s, "attest", "oldrun").unwrap());
     assert_eq!(
         s.call(
@@ -1624,7 +1606,6 @@ fn execution_in_flight_at_upgrade_has_a_human_path_out() {
         "failed"
     );
     assert!(has_event(&s, "oldrun", "human_attested_execution_ended"));
-    // The slot is free and the run behaves like a stopped one.
     s.call(
         "ext",
         Command::Extend {
@@ -1641,7 +1622,6 @@ fn execution_in_flight_at_upgrade_has_a_human_path_out() {
     )
     .unwrap();
     assert_eq!(terminal(&s, "oldrun")["state"], "finished");
-    // A known, healthy identity cannot be attested away.
     assert!(confirm(&s, "again", "oldrun").is_err());
 }
 fn has_event(s: &Service, run: &str, kind: &str) -> bool {
@@ -1685,7 +1665,6 @@ fn crashed_guardian_unknown_identity_is_released_by_human_attestation() {
     )
     .unwrap();
     wait(|| worker_started(&s, "crashed").then_some(()));
-    // The guardian dies without a receipt; its orphaned worker is killed by hand.
     let pid = s
         .call(
             "p",
@@ -1701,7 +1680,6 @@ fn crashed_guardian_unknown_identity_is_released_by_human_attestation() {
         .status();
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     wait(|| (controls(&s, "c", "crashed")["identity_unknown"] == true).then_some(()));
-    // Frozen: slot held, cleanup refused, refusals name the command.
     assert!(
         s.call(
             "blocked",
@@ -1800,13 +1778,11 @@ fn attestation_refuses_while_an_orphaned_worker_is_alive() {
         .output()
         .unwrap();
     let worker: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-    // Only the guardian dies; its worker is orphaned and keeps running in the worktree.
     unsafe { libc::kill(guardian as i32, libc::SIGKILL) };
     wait(|| (controls(&s, "c", "orphan")["identity_unknown"] == true).then_some(()));
     assert_eq!(unsafe { libc::kill(worker, 0) }, 0);
     let e = confirm(&s, "attest", "orphan").unwrap_err();
     assert!(e.contains(&worker.to_string()), "{e}");
-    // Nothing was released: still unknown, still frozen, no second worker possible.
     assert_eq!(controls(&s, "c2", "orphan")["identity_unknown"], true);
     assert!(!cli_cleanup(repo.path(), "orphan").status.success());
     assert!(
@@ -1818,7 +1794,6 @@ fn attestation_refuses_while_an_orphaned_worker_is_alive() {
         )
         .is_err()
     );
-    // Once the human actually stops it, the same attestation succeeds.
     unsafe { libc::kill(worker, libc::SIGKILL) };
     wait(|| (unsafe { libc::kill(worker, 0) } != 0).then_some(()));
     let done = confirm(&s, "attest-2", "orphan").unwrap();

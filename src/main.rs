@@ -14,14 +14,14 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// Validate a deterministic script through an external fake-agent process.
+    #[command(about = "Validate a deterministic script through an external fake-agent process")]
     Fake { script: String },
-    /// Create, retrieve or explicitly update immutable context snapshots.
+    #[command(about = "Create, retrieve or explicitly update immutable context snapshots")]
     Context {
         #[command(subcommand)]
         command: ContextCommand,
     },
-    /// Manage repository-local owned milestone worktrees.
+    #[command(about = "Manage repository-local owned milestone worktrees")]
     Worktree {
         #[arg(long)]
         repo: std::path::PathBuf,
@@ -58,7 +58,9 @@ enum RunCommand {
     Show {
         run: String,
     },
-    /// Show a run's controls; with --confirm-ended, attest that its unknown execution has ended.
+    #[command(
+        about = "Show a run's controls; with --confirm-ended, attest that its unknown execution has ended"
+    )]
     Reconcile {
         run: String,
         #[arg(long)]
