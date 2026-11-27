@@ -3,7 +3,7 @@
 A Rust autonomous project manager for approved specs: local Claude Code, Codex, and OpenCode workers produce independently reviewed GitHub PRs. Users own product merges. v1 acceptance is the full workflow in docs/PLAN.md on macOS and Linux.
 
 ## Status
-M0–M3 merged, 2026-11-02: contracts, durable fake-run supervisor, immutable context and owned Git worktrees exist. M4 execution controls are next; real backend adapters and autonomous project scheduling remain unimplemented.
+M0–M4 merged (M4 on 2026-11-04): contracts, durable fake-run supervisor, immutable context, owned Git worktrees, and execution budgets, recovery and takeover exist. #25 (attestation while a worker is alive) is fixed; its smaller follow-ups stay open there. M5 Claude Code adapter (#6) is next; real backend adapters and autonomous project scheduling remain unimplemented.
 
 ## Commands
 Required gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace --release`.
@@ -20,6 +20,7 @@ Required gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-ta
 - No silent backend switching or resetting budgets through task replacement.
 - Worker model: Codex gpt-6.1-sol in a T3-managed worktree, one milestone per draft PR. No further delegation by workers unless explicitly assigned.
 - Orchestrator owns integration, full-diff review, independent review/attack and merge. Workers never merge or release.
+- No code comments (docs/adr/0009); reasons go in names, tests or ADRs. `tests/comment_ratchet.rs` enforces it; `/delete-comment` cleans up.
 - Commit as ContractorKeith only, no AI attribution. Preserve unrelated changes.
 
 ## Tracking
